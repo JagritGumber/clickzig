@@ -1,42 +1,57 @@
-# clickhouse-zig
-clickhouse client for zig 
+# clickzig
 
-## Features
+a fast, native-protocol ClickHouse client for Zig.
 
-- Native ClickHouse protocol implementation
-- High performance with zero allocations in hot paths
-- Support for complex ClickHouse types
-- Connection pooling
-- Async query support
-- Compression (LZ4, ZSTD)
-- Bulk insert optimization
-- Streaming support for large result sets
-- Comprehensive error handling
+## what it is
 
-## Running Examples
+clickzig speaks the ClickHouse native binary protocol directly from Zig, with zero allocations in hot paths and full support for ClickHouse's complex type system. designed for high-throughput analytics workloads where the standard HTTP interface adds too much overhead.
 
-The project includes several examples demonstrating different features. To run a specific example:
+current version: **v0.15.2**
+
+## why Zig
+
+most ClickHouse clients are written in higher-level languages (Python, Go, Rust) and pay the cost in either runtime overhead or build complexity. Zig sits between C performance and Rust safety, with a build system that doesn't get in the way. clickzig leans into that — small binary, predictable allocation behavior, easy to embed.
+
+## features
+
+- native ClickHouse binary protocol implementation
+- zero allocations in hot paths
+- support for ClickHouse complex types (Array, Tuple, Map, Nullable, etc.)
+- connection pooling
+- async query support
+- compression (LZ4, ZSTD)
+- bulk insert optimization
+- streaming for large result sets
+- comprehensive error handling
+
+## examples
+
+the repo includes several examples covering different features. each example is buildable as a separate executable:
 
 ```bash
-# Build and run an example
-zig build run-$EXAMPLE_NAME
-
-# Available examples:
-zig build run-basic_connection    # Basic connection and query
-zig build run-bulk_insert        # Bulk data insertion
-zig build run-streaming          # Streaming large result sets
-zig build run-compression        # Data compression
-zig build run-transaction        # Transaction handling
-zig build run-async_query        # Async query execution
-zig build run-materialized_view  # Materialized view creation
-zig build run-dictionary         # Dictionary operations
-zig build run-distributed_table  # Distributed table setup
-zig build run-query_profiling    # Query profiling
-zig build run-mutations          # Data mutations
-zig build run-sampling          # Data sampling
-zig build run-complex_types     # Complex data types
-zig build run-pool_config       # Connection pool configuration
-zig build run-query_control     # Query monitoring and control
+zig build run-basic_connection    # basic connection and query
+zig build run-bulk_insert         # bulk data insertion
+zig build run-streaming           # streaming large result sets
+zig build run-compression         # data compression
+zig build run-transaction         # transaction handling
+zig build run-async_query         # async query execution
+zig build run-materialized_view   # materialized view creation
+zig build run-dictionary          # dictionary operations
+zig build run-distributed_table   # distributed table setup
+zig build run-query_profiling     # query profiling
+zig build run-mutations           # data mutations
+zig build run-sampling            # data sampling
+zig build run-complex_types       # complex data types
+zig build run-pool_config         # connection pool configuration
+zig build run-query_control       # query monitoring and control
 ```
 
-Each example demonstrates specific features and includes detailed comments explaining the functionality.
+each example has inline comments explaining the relevant feature.
+
+## status
+
+actively developed. v0.15.2 is the current release. API may shift before v1.0.
+
+## license
+
+see LICENSE file.
