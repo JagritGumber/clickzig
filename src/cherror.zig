@@ -42,18 +42,26 @@ pub const ClientError = error{
 };
 
 /// Wrapper for a server-returned error. Owns its strings.
+///
+/// SECURITY NOTE — `name`, `message`, and `stack_trace` are RAW BYTES
+/// from the server. They may contain ANSI escape sequences, OSC payloads,
+/// or other terminal control characters. A hostile or compromised server
+/// can use these to clear the user's terminal, rewrite the window title,
+/// or (on some terminals) write to the clipboard. Do NOT pass these
+/// directly to a TTY; sanitise C0/C1 controls before printing. A
+/// `sanitisedMessage()` helper is planned for v0.17.
 pub const ServerError = struct {
     /// Numeric error code from the server. Hundreds of codes exist in
     /// ClickHouse/src/Common/ErrorCodes.cpp; common ones are listed
     /// in the `Code` namespace below.
     code: u32,
     /// Server-supplied symbolic name (e.g. "DB::Exception::REQUIRED_PASSWORD").
-    /// May be an empty string if the server did not include one.
+    /// May be an empty string if the server did not include one. UNTRUSTED.
     name: []const u8,
-    /// Human-readable error message.
+    /// Human-readable error message. UNTRUSTED — see struct doc.
     message: []const u8,
     /// Optional server-side stack trace; presence depends on the server
-    /// `send_logs_level` setting and per-query overrides.
+    /// `send_logs_level` setting and per-query overrides. UNTRUSTED.
     stack_trace: ?[]const u8,
 
     allocator: std.mem.Allocator,
@@ -141,6 +149,9 @@ pub const Code = struct {
     pub const REQUIRED_PASSWORD: u32 = 194;
     pub const NETWORK_ERROR: u32 = 210;
     pub const SOCKET_TIMEOUT: u32 = 209;
+    /// Modern (CH 22.x+) replacement for WRONG_PASSWORD/REQUIRED_PASSWORD.
+    /// Returned for any failed auth: bad password, unknown user, etc.
+    pub const AUTHENTICATION_FAILED: u32 = 516;
 
     /// Symbolic name for a known code, or null if the code is not in
     /// our subset. Unknown codes are still valid - new ClickHouse versions
@@ -164,6 +175,7 @@ pub const Code = struct {
             REQUIRED_PASSWORD => "REQUIRED_PASSWORD",
             SOCKET_TIMEOUT => "SOCKET_TIMEOUT",
             NETWORK_ERROR => "NETWORK_ERROR",
+            AUTHENTICATION_FAILED => "AUTHENTICATION_FAILED",
             else => null,
         };
     }
