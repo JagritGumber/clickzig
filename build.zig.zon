@@ -1,9 +1,9 @@
 .{
-    .name = "clickhouse-zig",
-    .version = "0.1.0",
-    .dependencies = .{
-        // No external dependencies yet, as we include LZ4 and ZSTD directly
-    },
+    .name = .clickzig,
+    .version = "0.16.0",
+    .fingerprint = 0x5491b43e7a7baa19,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
     .paths = .{
         "src",
         "examples",
