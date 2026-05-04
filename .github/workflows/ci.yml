@@ -69,3 +69,7 @@ jobs:
         run: zig build smoke -- query-mixed
       - name: smoke insert-roundtrip
         run: zig build smoke -- insert-roundtrip
+      - name: smoke nullable-roundtrip
+        run: zig build smoke -- nullable-roundtrip
+      - name: smoke complex-types
+        run: zig build smoke -- complex-types

@@ -37,10 +37,101 @@ pub fn main(init: std.process.Init) !void {
         try runQueryMixed(allocator, io);
     } else if (std.mem.eql(u8, scenario, "insert-roundtrip")) {
         try runInsertRoundtrip(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "nullable-roundtrip")) {
+        try runNullableRoundtrip(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "complex-types")) {
+        try runComplexTypes(allocator, io);
     } else {
         std.debug.print("usage: smoke_connect [happy|ping|wrong-pass|unreachable|wrong-host|query-bytes]\n", .{});
         return error.UnknownScenario;
     }
+}
+
+fn runComplexTypes(allocator: std.mem.Allocator, io: std.Io) !void {
+    // Hit Array, FixedString, and UUID in one query against the server.
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    defer client.close();
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+
+    var s = try client.query(
+        \\SELECT
+        \\    [number, number * 2, number * 3] AS arr,
+        \\    toFixedString(toString(number), 4) AS fs,
+        \\    generateUUIDv4() AS id
+        \\FROM numbers(2)
+    , arena.allocator(), null, .{});
+    var rows: u64 = 0;
+    while (try s.next()) |p| switch (p) {
+        .data => |b| {
+            if (b.num_rows == 0) continue;
+            const arr = b.columns[0].column.Array;
+            const fs = b.columns[1].column.FixedString;
+            const ids = b.columns[2].column.UUID;
+            std.debug.print("[complex] arr type={s}, fs.width={d}\n", .{ b.columns[0].type_name, fs.width });
+            var i: usize = 0;
+            while (i < b.num_rows) : (i += 1) {
+                const start: usize = if (i == 0) 0 else @intCast(arr.offsets[i - 1]);
+                const end: usize = @intCast(arr.offsets[i]);
+                const row_arr = arr.inner.UInt64[start..end];
+                const fs_row = fs.data[i * fs.width .. (i + 1) * fs.width];
+                std.debug.print("[complex] row {d}: arr={any} fs='{s}' uuid_first_byte=0x{X:0>2}\n", .{ i, row_arr, fs_row, ids[i][0] });
+                if (row_arr.len != 3) return error.ArrayShapeMismatch;
+                if (row_arr[0] != i) return error.ArrayValueMismatch;
+                if (row_arr[1] != i * 2) return error.ArrayValueMismatch;
+                if (row_arr[2] != i * 3) return error.ArrayValueMismatch;
+            }
+            rows += b.num_rows;
+        },
+        .end_of_stream => break,
+        .exception => |e| { std.debug.print("[complex] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        else => {},
+    };
+    if (rows != 2) return error.UnexpectedRowCount;
+    std.debug.print("[complex] OK: 2 rows of (Array(UInt64), FixedString(4), UUID)\n", .{});
+}
+
+fn runNullableRoundtrip(allocator: std.mem.Allocator, io: std.Io) !void {
+    // Read a server-generated Nullable column and verify the mask comes
+    // through. Bypasses INSERT to keep the test scope focused on read.
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    defer client.close();
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+
+    var s = try client.query(
+        \\SELECT
+        \\    number AS n,
+        \\    if(number % 2 = 0, NULL, toUInt32(number * 10)) AS maybe_n
+        \\FROM numbers(5)
+    , arena.allocator(), null, .{});
+    var rows_seen: u64 = 0;
+    while (try s.next()) |p| switch (p) {
+        .data => |b| {
+            if (b.num_rows == 0) continue;
+            const ns = b.columns[0].column.UInt64;
+            const nullable = b.columns[1].column.Nullable;
+            const maybe = nullable.inner.UInt32;
+            std.debug.print("[nullable] type={s}\n", .{b.columns[1].type_name});
+            var i: usize = 0;
+            while (i < b.num_rows) : (i += 1) {
+                if (nullable.mask[i] != 0) {
+                    std.debug.print("[nullable] row n={d}: maybe_n=NULL\n", .{ns[i]});
+                    if (ns[i] % 2 != 0) return error.NullMaskMismatch;
+                } else {
+                    std.debug.print("[nullable] row n={d}: maybe_n={d}\n", .{ ns[i], maybe[i] });
+                    if (ns[i] % 2 == 0) return error.NullMaskMismatch;
+                    if (maybe[i] != ns[i] * 10) return error.ValueMismatch;
+                }
+            }
+            rows_seen += b.num_rows;
+        },
+        .end_of_stream => break,
+        .exception => |e| { std.debug.print("[nullable] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        else => {},
+    };
+    if (rows_seen != 5) return error.UnexpectedRowCount;
+    std.debug.print("[nullable] OK: 5 rows with mixed null/non-null\n", .{});
 }
 
 fn runInsertRoundtrip(allocator: std.mem.Allocator, io: std.Io) !void {

@@ -11,6 +11,7 @@ const std = @import("std");
 const wire = @import("wire.zig");
 const varint = @import("varint.zig");
 
+/// Identifies a primitive (non-wrapped) column type.
 pub const TypeId = enum {
     UInt8, UInt16, UInt32, UInt64,
     Int8, Int16, Int32, Int64,
@@ -18,7 +19,7 @@ pub const TypeId = enum {
     String,
 };
 
-pub const Column = union(TypeId) {
+pub const Column = union(enum) {
     UInt8: []u8,
     UInt16: []u16,
     UInt32: []u32,
@@ -29,10 +30,22 @@ pub const Column = union(TypeId) {
     Int64: []i64,
     Float32: []f32,
     Float64: []f64,
-    /// Each entry owned independently (one alloc for the slice-of-slices
-    /// plus per-row allocs for the bytes). Callers freeing a Column must
-    /// walk the inner slice for `String`.
     String: [][]u8,
+    /// Nullable(T) — boxed because Zig unions can't hold a recursive
+    /// payload by value. Owns the mask and the inner column. Caller
+    /// reads `n.mask[i] != 0` then `n.inner.<TypeTag>[i]` for the value.
+    Nullable: *Nullable,
+    /// Array(T). `offsets[i]` = cumulative element count after row i.
+    /// Row i's elements are `inner[offsets[i-1]..offsets[i]]`
+    /// (with offsets[-1] = 0). Inner column holds the flattened
+    /// concatenation across all rows.
+    Array: *Array,
+    /// FixedString(N). Width in bytes is held alongside the flat data
+    /// `data.len = num_rows * width`. Row i bytes: `data[i*width..][0..width]`.
+    FixedString: FixedString,
+    /// UUID — 16 bytes per row, big-endian network order. Caller
+    /// interprets via `[16]u8` directly.
+    UUID: [][16]u8,
 
     pub fn deinit(self: Column, allocator: std.mem.Allocator) void {
         switch (self) {
@@ -40,15 +53,50 @@ pub const Column = union(TypeId) {
                 for (rows) |row| allocator.free(row);
                 allocator.free(rows);
             },
+            .Nullable => |n| n.deinit(allocator),
+            .Array => |a| a.deinit(allocator),
+            .FixedString => |fs| allocator.free(fs.data),
+            .UUID => |rows| allocator.free(rows),
             inline else => |slice| allocator.free(slice),
         }
     }
 
     pub fn len(self: Column) usize {
         return switch (self) {
+            .Nullable => |n| n.mask.len,
+            .Array => |a| a.offsets.len,
+            .FixedString => |fs| if (fs.width == 0) 0 else fs.data.len / fs.width,
             inline else => |slice| slice.len,
         };
     }
+};
+
+pub const Nullable = struct {
+    mask: []u8,
+    inner: Column,
+
+    pub fn deinit(self: *Nullable, allocator: std.mem.Allocator) void {
+        allocator.free(self.mask);
+        self.inner.deinit(allocator);
+        allocator.destroy(self);
+    }
+};
+
+pub const Array = struct {
+    /// Cumulative end-offsets per row. Length == num_rows.
+    offsets: []u64,
+    inner: Column,
+
+    pub fn deinit(self: *Array, allocator: std.mem.Allocator) void {
+        allocator.free(self.offsets);
+        self.inner.deinit(allocator);
+        allocator.destroy(self);
+    }
+};
+
+pub const FixedString = struct {
+    width: usize,
+    data: []u8,
 };
 
 pub const Error = error{
@@ -88,6 +136,47 @@ pub fn readColumn(
     type_name: []const u8,
     num_rows: u64,
 ) !Column {
+    if (extractNullableInner(type_name)) |inner_name| {
+        const n_rows: usize = @intCast(num_rows);
+        const ptr = try allocator.create(Nullable);
+        errdefer allocator.destroy(ptr);
+        const mask = try allocator.alloc(u8, n_rows);
+        errdefer allocator.free(mask);
+        try reader.readSliceAll(mask);
+        ptr.* = .{
+            .mask = mask,
+            .inner = try readColumn(reader, allocator, inner_name, num_rows),
+        };
+        return .{ .Nullable = ptr };
+    }
+    if (extractArrayInner(type_name)) |inner_name| {
+        const n_rows: usize = @intCast(num_rows);
+        const ptr = try allocator.create(Array);
+        errdefer allocator.destroy(ptr);
+        const offsets = try allocator.alloc(u64, n_rows);
+        errdefer allocator.free(offsets);
+        try reader.readSliceAll(std.mem.sliceAsBytes(offsets));
+        const total: u64 = if (n_rows == 0) 0 else offsets[n_rows - 1];
+        ptr.* = .{
+            .offsets = offsets,
+            .inner = try readColumn(reader, allocator, inner_name, total),
+        };
+        return .{ .Array = ptr };
+    }
+    if (extractFixedStringWidth(type_name)) |width| {
+        const total = @as(usize, @intCast(num_rows)) * width;
+        const data = try allocator.alloc(u8, total);
+        errdefer allocator.free(data);
+        try reader.readSliceAll(data);
+        return .{ .FixedString = .{ .width = width, .data = data } };
+    }
+    if (std.mem.eql(u8, type_name, "UUID")) {
+        const n_rows: usize = @intCast(num_rows);
+        const rows = try allocator.alloc([16]u8, n_rows);
+        errdefer allocator.free(rows);
+        try reader.readSliceAll(std.mem.sliceAsBytes(rows));
+        return .{ .UUID = rows };
+    }
     const tid = typeIdFromName(type_name) orelse return error.UnsupportedColumnType;
     const n: usize = @intCast(num_rows);
     return switch (tid) {
@@ -134,8 +223,44 @@ pub fn writeColumn(writer: *std.Io.Writer, col: Column) std.Io.Writer.Error!void
         .String => |rows| {
             for (rows) |row| try wire.writeStringBinary(writer, row);
         },
+        .Nullable => |n| {
+            try writer.writeAll(n.mask);
+            try writeColumn(writer, n.inner);
+        },
+        .Array => |a| {
+            try writer.writeAll(std.mem.sliceAsBytes(a.offsets));
+            try writeColumn(writer, a.inner);
+        },
+        .FixedString => |fs| try writer.writeAll(fs.data),
+        .UUID => |rows| try writer.writeAll(std.mem.sliceAsBytes(rows)),
         inline else => |slice| try writer.writeAll(std.mem.sliceAsBytes(slice)),
     }
+}
+
+pub fn extractArrayInner(type_name: []const u8) ?[]const u8 {
+    const prefix = "Array(";
+    if (!std.mem.startsWith(u8, type_name, prefix)) return null;
+    if (!std.mem.endsWith(u8, type_name, ")")) return null;
+    return type_name[prefix.len .. type_name.len - 1];
+}
+
+pub fn extractFixedStringWidth(type_name: []const u8) ?usize {
+    const prefix = "FixedString(";
+    if (!std.mem.startsWith(u8, type_name, prefix)) return null;
+    if (!std.mem.endsWith(u8, type_name, ")")) return null;
+    const inside = type_name[prefix.len .. type_name.len - 1];
+    return std.fmt.parseInt(usize, inside, 10) catch null;
+}
+
+/// Returns the inner type name if `type_name` matches "Nullable(...)",
+/// otherwise null. Trims surrounding whitespace conservatively. Does
+/// not validate the inner string — `readColumn` recurses and that
+/// recursion will reject if the inner is itself unsupported.
+pub fn extractNullableInner(type_name: []const u8) ?[]const u8 {
+    const prefix = "Nullable(";
+    if (!std.mem.startsWith(u8, type_name, prefix)) return null;
+    if (!std.mem.endsWith(u8, type_name, ")")) return null;
+    return type_name[prefix.len .. type_name.len - 1];
 }
 
 /// Resolve a TypeId back to its canonical wire type name. Round-trip
@@ -170,6 +295,94 @@ test "writeColumn UInt32 round-trips through readColumn" {
     const col_out = try readColumn(&r, testing.allocator, "UInt32", 3);
     defer col_out.deinit(testing.allocator);
     try testing.expectEqualSlices(u32, &original, col_out.UInt32);
+}
+
+test "extractNullableInner peels Nullable wrapper" {
+    try testing.expectEqualStrings("UInt32", extractNullableInner("Nullable(UInt32)").?);
+    try testing.expectEqualStrings("String", extractNullableInner("Nullable(String)").?);
+    try testing.expectEqual(@as(?[]const u8, null), extractNullableInner("UInt32"));
+    try testing.expectEqual(@as(?[]const u8, null), extractNullableInner("Array(UInt8)"));
+}
+
+test "Array(UInt32) round-trips" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    // Three rows: [10, 20], [], [30]
+    var offsets = [_]u64{ 2, 2, 3 };
+    var values = [_]u32{ 10, 20, 30 };
+    var array_box: Array = .{
+        .offsets = &offsets,
+        .inner = .{ .UInt32 = &values },
+    };
+    const col_in: Column = .{ .Array = &array_box };
+    try writeColumn(&w, col_in);
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col_out = try readColumn(&r, testing.allocator, "Array(UInt32)", 3);
+    defer col_out.deinit(testing.allocator);
+    try testing.expectEqualSlices(u64, &offsets, col_out.Array.offsets);
+    try testing.expectEqualSlices(u32, &values, col_out.Array.inner.UInt32);
+    try testing.expectEqual(@as(usize, 3), col_out.len());
+}
+
+test "FixedString(4) round-trips" {
+    var buf: [32]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var data = [_]u8{ 'a','b','c','d', 'e','f','g','h', 'i','j','k','l' };
+    const col_in: Column = .{ .FixedString = .{ .width = 4, .data = &data } };
+    try writeColumn(&w, col_in);
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col_out = try readColumn(&r, testing.allocator, "FixedString(4)", 3);
+    defer col_out.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), col_out.FixedString.width);
+    try testing.expectEqualSlices(u8, &data, col_out.FixedString.data);
+    try testing.expectEqual(@as(usize, 3), col_out.len());
+}
+
+test "UUID round-trips" {
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var rows: [2][16]u8 = .{ .{1}**16, .{2,2,2,2, 2,2,2,2, 2,2,2,2, 2,2,2,2} };
+    const col_in: Column = .{ .UUID = &rows };
+    try writeColumn(&w, col_in);
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col_out = try readColumn(&r, testing.allocator, "UUID", 2);
+    defer col_out.deinit(testing.allocator);
+    try testing.expectEqualSlices(u8, &rows[0], &col_out.UUID[0]);
+    try testing.expectEqualSlices(u8, &rows[1], &col_out.UUID[1]);
+}
+
+test "extractArrayInner / extractFixedStringWidth" {
+    try testing.expectEqualStrings("UInt32", extractArrayInner("Array(UInt32)").?);
+    try testing.expectEqualStrings("Nullable(Int8)", extractArrayInner("Array(Nullable(Int8))").?);
+    try testing.expectEqual(@as(?[]const u8, null), extractArrayInner("UInt32"));
+    try testing.expectEqual(@as(?usize, 8), extractFixedStringWidth("FixedString(8)"));
+    try testing.expectEqual(@as(?usize, 256), extractFixedStringWidth("FixedString(256)"));
+    try testing.expectEqual(@as(?usize, null), extractFixedStringWidth("String"));
+}
+
+test "Nullable(UInt32) round-trips with mixed null/non-null" {
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    // 4 rows: 100, NULL, 300, 400.
+    var mask = [_]u8{ 0, 1, 0, 0 };
+    var values = [_]u32{ 100, 0xDEADBEEF, 300, 400 }; // value at idx 1 is placeholder
+    var inner_box: Nullable = .{
+        .mask = &mask,
+        .inner = .{ .UInt32 = &values },
+    };
+    const col_in: Column = .{ .Nullable = &inner_box };
+    try writeColumn(&w, col_in);
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col_out = try readColumn(&r, testing.allocator, "Nullable(UInt32)", 4);
+    defer col_out.deinit(testing.allocator);
+    const n = col_out.Nullable;
+    try testing.expectEqualSlices(u8, &mask, n.mask);
+    try testing.expectEqualSlices(u32, &values, n.inner.UInt32);
+    try testing.expectEqual(@as(usize, 4), col_out.len());
 }
 
 test "writeColumn String round-trips" {
@@ -227,5 +440,7 @@ test "readColumn String round-trips multibyte rows" {
 
 test "readColumn rejects unknown type" {
     var r: std.Io.Reader = .fixed(&[_]u8{});
-    try testing.expectError(error.UnsupportedColumnType, readColumn(&r, testing.allocator, "Nullable(Int32)", 0));
+    // Decimal/Map/Tuple/IPv4/IPv6 — pick one that v0.16.0 still doesn't
+    // decode. Update when support lands.
+    try testing.expectError(error.UnsupportedColumnType, readColumn(&r, testing.allocator, "Decimal(18, 4)", 0));
 }
