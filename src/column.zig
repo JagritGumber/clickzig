@@ -13,8 +13,8 @@ const varint = @import("varint.zig");
 
 /// Identifies a primitive (non-wrapped) column type.
 pub const TypeId = enum {
-    UInt8, UInt16, UInt32, UInt64, UInt128,
-    Int8, Int16, Int32, Int64, Int128,
+    UInt8, UInt16, UInt32, UInt64, UInt128, UInt256,
+    Int8, Int16, Int32, Int64, Int128, Int256,
     Float32, Float64,
     String,
 };
@@ -25,11 +25,13 @@ pub const Column = union(enum) {
     UInt32: []u32,
     UInt64: []u64,
     UInt128: []u128,
+    UInt256: []u256,
     Int8: []i8,
     Int16: []i16,
     Int32: []i32,
     Int64: []i64,
     Int128: []i128,
+    Int256: []i256,
     Float32: []f32,
     Float64: []f64,
     String: [][]u8,
@@ -48,6 +50,14 @@ pub const Column = union(enum) {
     /// UUID — 16 bytes per row, big-endian network order. Caller
     /// interprets via `[16]u8` directly.
     UUID: [][16]u8,
+    /// Tuple(T1, T2, ...). Each element column has the same row-count
+    /// as the parent block. Wire format: N inner columns concatenated
+    /// (NO per-row tag, NO offsets — the row-count is shared).
+    Tuple: *Tuple,
+    /// Map(K, V). Wire format identical to Array(Tuple(K, V)): a
+    /// cumulative offset table followed by interleaved key/value
+    /// columns of total `offsets[N-1]` length each.
+    Map: *Map,
 
     pub fn deinit(self: Column, allocator: std.mem.Allocator) void {
         switch (self) {
@@ -59,6 +69,8 @@ pub const Column = union(enum) {
             .Array => |a| a.deinit(allocator),
             .FixedString => |fs| allocator.free(fs.data),
             .UUID => |rows| allocator.free(rows),
+            .Tuple => |t| t.deinit(allocator),
+            .Map => |m| m.deinit(allocator),
             inline else => |slice| allocator.free(slice),
         }
     }
@@ -68,6 +80,8 @@ pub const Column = union(enum) {
             .Nullable => |n| n.mask.len,
             .Array => |a| a.offsets.len,
             .FixedString => |fs| if (fs.width == 0) 0 else fs.data.len / fs.width,
+            .Tuple => |t| t.row_count,
+            .Map => |m| m.offsets.len,
             inline else => |slice| slice.len,
         };
     }
@@ -101,6 +115,35 @@ pub const FixedString = struct {
     data: []u8,
 };
 
+pub const Tuple = struct {
+    /// Number of rows shared across every element column.
+    row_count: u64,
+    /// One Column per tuple element. Owned.
+    elements: []Column,
+
+    pub fn deinit(self: *Tuple, allocator: std.mem.Allocator) void {
+        for (self.elements) |e| e.deinit(allocator);
+        allocator.free(self.elements);
+        allocator.destroy(self);
+    }
+};
+
+pub const Map = struct {
+    /// Cumulative end-offsets per outer row. Length == num_rows.
+    offsets: []u64,
+    /// Flattened keys; length == offsets[N-1].
+    keys: Column,
+    /// Flattened values; length == offsets[N-1].
+    values: Column,
+
+    pub fn deinit(self: *Map, allocator: std.mem.Allocator) void {
+        allocator.free(self.offsets);
+        self.keys.deinit(allocator);
+        self.values.deinit(allocator);
+        allocator.destroy(self);
+    }
+};
+
 pub const Error = error{
     UnsupportedColumnType,
 };
@@ -118,11 +161,13 @@ pub fn typeIdFromName(type_name: []const u8) ?TypeId {
     if (eq(u8, type_name, "UInt32") or eq(u8, type_name, "IPv4")) return .UInt32;
     if (eq(u8, type_name, "UInt64")) return .UInt64;
     if (eq(u8, type_name, "UInt128")) return .UInt128;
+    if (eq(u8, type_name, "UInt256")) return .UInt256;
     if (eq(u8, type_name, "Int8") or startsWith(u8, type_name, "Enum8")) return .Int8;
     if (eq(u8, type_name, "Int16") or startsWith(u8, type_name, "Enum16")) return .Int16;
     if (eq(u8, type_name, "Int32") or eq(u8, type_name, "Date32")) return .Int32;
     if (eq(u8, type_name, "Int64")) return .Int64;
     if (eq(u8, type_name, "Int128")) return .Int128;
+    if (eq(u8, type_name, "Int256")) return .Int256;
     if (eq(u8, type_name, "Float32")) return .Float32;
     if (eq(u8, type_name, "Float64")) return .Float64;
     if (eq(u8, type_name, "String")) return .String;
@@ -136,12 +181,13 @@ pub fn typeIdFromName(type_name: []const u8) ?TypeId {
     if (startsWith(u8, type_name, "Decimal32")) return .Int32;
     if (startsWith(u8, type_name, "Decimal64")) return .Int64;
     if (startsWith(u8, type_name, "Decimal128")) return .Int128;
+    if (startsWith(u8, type_name, "Decimal256")) return .Int256;
     if (startsWith(u8, type_name, "Decimal(")) {
         // Decimal(P, S): underlying int width determined by P.
         //   P <=  9 → Int32   (Decimal32)
         //   P <= 18 → Int64   (Decimal64)
         //   P <= 38 → Int128  (Decimal128)
-        //   P <= 76 → Int256  (not yet supported; returns null)
+        //   P <= 76 → Int256  (Decimal256)
         const inside = type_name[8..type_name.len - 1];
         const comma = std.mem.indexOfScalar(u8, inside, ',') orelse return null;
         const p_str = std.mem.trim(u8, inside[0..comma], " ");
@@ -149,6 +195,7 @@ pub fn typeIdFromName(type_name: []const u8) ?TypeId {
         if (p <= 9) return .Int32;
         if (p <= 18) return .Int64;
         if (p <= 38) return .Int128;
+        if (p <= 76) return .Int256;
         return null;
     }
     return null;
@@ -201,6 +248,39 @@ pub fn readColumn(
         try reader.readSliceAll(std.mem.sliceAsBytes(rows));
         return .{ .UUID = rows };
     }
+    if (extractMapKV(type_name)) |kv| {
+        // Map(K, V) wire format = Array(Tuple(K, V)): one offsets table
+        // covering both key and value columns; keys flat then values flat.
+        const n_rows: usize = @intCast(num_rows);
+        const ptr = try allocator.create(Map);
+        errdefer allocator.destroy(ptr);
+        const offsets = try allocator.alloc(u64, n_rows);
+        errdefer allocator.free(offsets);
+        try reader.readSliceAll(std.mem.sliceAsBytes(offsets));
+        const total: u64 = if (n_rows == 0) 0 else offsets[n_rows - 1];
+        const keys = try readColumn(reader, allocator, kv.key, total);
+        errdefer keys.deinit(allocator);
+        const values = try readColumn(reader, allocator, kv.value, total);
+        ptr.* = .{ .offsets = offsets, .keys = keys, .values = values };
+        return .{ .Map = ptr };
+    }
+    if (extractTupleArgs(type_name)) |args_str| {
+        const ptr = try allocator.create(Tuple);
+        errdefer allocator.destroy(ptr);
+        // Count comma-separated top-level args; each one is an element type.
+        var elements_list: std.ArrayListUnmanaged(Column) = .empty;
+        errdefer {
+            for (elements_list.items) |c| c.deinit(allocator);
+            elements_list.deinit(allocator);
+        }
+        var iter = topLevelTupleSplit(args_str);
+        while (iter.next()) |elem_type| {
+            const elem = try readColumn(reader, allocator, elem_type, num_rows);
+            try elements_list.append(allocator, elem);
+        }
+        ptr.* = .{ .row_count = num_rows, .elements = try elements_list.toOwnedSlice(allocator) };
+        return .{ .Tuple = ptr };
+    }
     // IPv6 is canonically a 16-byte fixed-width column on the wire.
     if (std.mem.eql(u8, type_name, "IPv6")) {
         const total = @as(usize, @intCast(num_rows)) * 16;
@@ -217,11 +297,13 @@ pub fn readColumn(
         .UInt32 => .{ .UInt32 = try readFixed(u32, reader, allocator, n) },
         .UInt64 => .{ .UInt64 = try readFixed(u64, reader, allocator, n) },
         .UInt128 => .{ .UInt128 = try readFixed(u128, reader, allocator, n) },
+        .UInt256 => .{ .UInt256 = try readFixed(u256, reader, allocator, n) },
         .Int8 => .{ .Int8 = try readFixed(i8, reader, allocator, n) },
         .Int16 => .{ .Int16 = try readFixed(i16, reader, allocator, n) },
         .Int32 => .{ .Int32 = try readFixed(i32, reader, allocator, n) },
         .Int64 => .{ .Int64 = try readFixed(i64, reader, allocator, n) },
         .Int128 => .{ .Int128 = try readFixed(i128, reader, allocator, n) },
+        .Int256 => .{ .Int256 = try readFixed(i256, reader, allocator, n) },
         .Float32 => .{ .Float32 = try readFixed(f32, reader, allocator, n) },
         .Float64 => .{ .Float64 = try readFixed(f64, reader, allocator, n) },
         .String => blk: {
@@ -267,6 +349,14 @@ pub fn writeColumn(writer: *std.Io.Writer, col: Column) std.Io.Writer.Error!void
         },
         .FixedString => |fs| try writer.writeAll(fs.data),
         .UUID => |rows| try writer.writeAll(std.mem.sliceAsBytes(rows)),
+        .Tuple => |t| {
+            for (t.elements) |e| try writeColumn(writer, e);
+        },
+        .Map => |m| {
+            try writer.writeAll(std.mem.sliceAsBytes(m.offsets));
+            try writeColumn(writer, m.keys);
+            try writeColumn(writer, m.values);
+        },
         inline else => |slice| try writer.writeAll(std.mem.sliceAsBytes(slice)),
     }
 }
@@ -276,6 +366,68 @@ pub fn extractArrayInner(type_name: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, type_name, prefix)) return null;
     if (!std.mem.endsWith(u8, type_name, ")")) return null;
     return type_name[prefix.len .. type_name.len - 1];
+}
+
+pub const MapKV = struct { key: []const u8, value: []const u8 };
+
+/// Split "Map(K, V)" into K and V at the top-level comma. Inner commas
+/// inside nested types are skipped via depth tracking.
+pub fn extractMapKV(type_name: []const u8) ?MapKV {
+    const prefix = "Map(";
+    if (!std.mem.startsWith(u8, type_name, prefix)) return null;
+    if (!std.mem.endsWith(u8, type_name, ")")) return null;
+    const inside = type_name[prefix.len .. type_name.len - 1];
+    var depth: u32 = 0;
+    var i: usize = 0;
+    while (i < inside.len) : (i += 1) {
+        switch (inside[i]) {
+            '(' => depth += 1,
+            ')' => if (depth > 0) { depth -= 1; },
+            ',' => if (depth == 0) {
+                const k = std.mem.trim(u8, inside[0..i], " ");
+                const v = std.mem.trim(u8, inside[i + 1 ..], " ");
+                return .{ .key = k, .value = v };
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+pub fn extractTupleArgs(type_name: []const u8) ?[]const u8 {
+    const prefix = "Tuple(";
+    if (!std.mem.startsWith(u8, type_name, prefix)) return null;
+    if (!std.mem.endsWith(u8, type_name, ")")) return null;
+    return type_name[prefix.len .. type_name.len - 1];
+}
+
+/// Iterator over comma-separated top-level type-names inside a Tuple
+/// or similar. Tracks nesting depth so commas inside Array(...) /
+/// Tuple(...) etc don't split prematurely.
+pub const TopLevelSplit = struct {
+    src: []const u8,
+    pos: usize = 0,
+    pub fn next(self: *TopLevelSplit) ?[]const u8 {
+        if (self.pos >= self.src.len) return null;
+        var depth: u32 = 0;
+        const start = self.pos;
+        while (self.pos < self.src.len) : (self.pos += 1) {
+            const c = self.src[self.pos];
+            if (c == '(') depth += 1;
+            if (c == ')' and depth > 0) depth -= 1;
+            if (c == ',' and depth == 0) {
+                const piece = std.mem.trim(u8, self.src[start..self.pos], " ");
+                self.pos += 1;
+                return piece;
+            }
+        }
+        const tail = std.mem.trim(u8, self.src[start..self.pos], " ");
+        return tail;
+    }
+};
+
+pub fn topLevelTupleSplit(src: []const u8) TopLevelSplit {
+    return .{ .src = src };
 }
 
 pub fn extractFixedStringWidth(type_name: []const u8) ?usize {
@@ -397,6 +549,56 @@ test "extractArrayInner / extractFixedStringWidth" {
     try testing.expectEqual(@as(?usize, null), extractFixedStringWidth("String"));
 }
 
+test "extractMapKV handles nested commas" {
+    const kv = extractMapKV("Map(String, Array(UInt32))").?;
+    try testing.expectEqualStrings("String", kv.key);
+    try testing.expectEqualStrings("Array(UInt32)", kv.value);
+}
+
+test "extractTupleArgs + topLevelTupleSplit" {
+    const args = extractTupleArgs("Tuple(UInt8, String, Array(Int32))").?;
+    var it = topLevelTupleSplit(args);
+    try testing.expectEqualStrings("UInt8", it.next().?);
+    try testing.expectEqualStrings("String", it.next().?);
+    try testing.expectEqualStrings("Array(Int32)", it.next().?);
+    try testing.expectEqual(@as(?[]const u8, null), it.next());
+}
+
+test "Tuple(UInt32, String) round-trips" {
+    const ally = testing.allocator;
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var ids = [_]u32{ 1, 2, 3 };
+    var labels = [_][]u8{ @constCast("a"), @constCast("bb"), @constCast("ccc") };
+    var elements = [_]Column{
+        .{ .UInt32 = &ids },
+        .{ .String = &labels },
+    };
+    var tup_box: Tuple = .{ .row_count = 3, .elements = &elements };
+    const col_in: Column = .{ .Tuple = &tup_box };
+    try writeColumn(&w, col_in);
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col_out = try readColumn(&r, ally, "Tuple(UInt32, String)", 3);
+    defer col_out.deinit(ally);
+    try testing.expectEqualSlices(u32, &ids, col_out.Tuple.elements[0].UInt32);
+    try testing.expectEqualStrings("ccc", col_out.Tuple.elements[1].String[2]);
+    try testing.expectEqual(@as(usize, 3), col_out.len());
+}
+
+test "Int256 round-trips" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var values = [_]i256{ 1, -1, std.math.maxInt(i256) };
+    const col_in: Column = .{ .Int256 = &values };
+    try writeColumn(&w, col_in);
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col_out = try readColumn(&r, testing.allocator, "Int256", 3);
+    defer col_out.deinit(testing.allocator);
+    try testing.expectEqualSlices(i256, &values, col_out.Int256);
+}
+
 test "Nullable(UInt32) round-trips with mixed null/non-null" {
     var buf: [64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -474,7 +676,7 @@ test "readColumn String round-trips multibyte rows" {
 
 test "readColumn rejects unknown type" {
     var r: std.Io.Reader = .fixed(&[_]u8{});
-    // Tuple/Map/LowCardinality — v0.16.0 still doesn't decode these.
-    // Update the string when support lands.
-    try testing.expectError(error.UnsupportedColumnType, readColumn(&r, testing.allocator, "Tuple(UInt8, String)", 0));
+    // LowCardinality decoder lands later; this is the v0.16.0
+    // sentinel for "type we don't yet handle".
+    try testing.expectError(error.UnsupportedColumnType, readColumn(&r, testing.allocator, "LowCardinality(String)", 0));
 }

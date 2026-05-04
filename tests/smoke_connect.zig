@@ -47,10 +47,51 @@ pub fn main(init: std.process.Init) !void {
         try runDsn(allocator, io);
     } else if (std.mem.eql(u8, scenario, "decimal-ip")) {
         try runDecimalIp(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "tuple-map")) {
+        try runTupleMap(allocator, io);
     } else {
         std.debug.print("usage: smoke_connect [happy|ping|wrong-pass|unreachable|wrong-host|query-bytes]\n", .{});
         return error.UnknownScenario;
     }
+}
+
+fn runTupleMap(allocator: std.mem.Allocator, io: std.Io) !void {
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    defer client.close();
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    var s = try client.query(
+        \\SELECT
+        \\    (number, toString(number * 10)) AS pair,
+        \\    map('a', toInt64(1), 'b', toInt64(number)) AS m
+        \\FROM numbers(2)
+    , arena.allocator(), null, .{});
+    var rows: u64 = 0;
+    while (try s.next()) |p| switch (p) {
+        .data => |b| {
+            if (b.num_rows == 0) continue;
+            const tup = b.columns[0].column.Tuple;
+            const mp = b.columns[1].column.Map;
+            var i: usize = 0;
+            while (i < b.num_rows) : (i += 1) {
+                const n = tup.elements[0].UInt64[i];
+                const s_val = tup.elements[1].String[i];
+                std.debug.print("[tuple-map] pair=({d}, {s})\n", .{ n, s_val });
+                const start: usize = if (i == 0) 0 else @intCast(mp.offsets[i - 1]);
+                const end: usize = @intCast(mp.offsets[i]);
+                var j: usize = start;
+                while (j < end) : (j += 1) {
+                    std.debug.print("[tuple-map]   m[{s}]={d}\n", .{ mp.keys.String[j], mp.values.Int64[j] });
+                }
+            }
+            rows += b.num_rows;
+        },
+        .end_of_stream => break,
+        .exception => |e| { std.debug.print("[tuple-map] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        else => {},
+    };
+    if (rows != 2) return error.UnexpectedRowCount;
+    std.debug.print("[tuple-map] OK\n", .{});
 }
 
 fn runDecimalIp(allocator: std.mem.Allocator, io: std.Io) !void {

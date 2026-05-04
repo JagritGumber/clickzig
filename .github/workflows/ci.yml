@@ -79,3 +79,5 @@ jobs:
         run: zig build smoke -- dsn
       - name: smoke decimal-ip
         run: zig build smoke -- decimal-ip
+      - name: smoke tuple-map
+        run: zig build smoke -- tuple-map
