@@ -33,6 +33,8 @@ pub const result_stream = @import("result_stream.zig");
 pub const pool = @import("pool.zig");
 pub const Pool = pool.Pool;
 pub const PoolOptions = pool.Options;
+pub const dsn = @import("dsn.zig");
+pub const fromUri = dsn.fromUri;
 
 pub const ClientError = cherror.ClientError;
 pub const ServerError = cherror.ServerError;

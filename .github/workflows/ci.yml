@@ -75,3 +75,5 @@ jobs:
         run: zig build smoke -- complex-types
       - name: smoke pool
         run: zig build smoke -- pool
+      - name: smoke dsn
+        run: zig build smoke -- dsn

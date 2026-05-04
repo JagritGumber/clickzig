@@ -43,10 +43,31 @@ pub fn main(init: std.process.Init) !void {
         try runComplexTypes(allocator, io);
     } else if (std.mem.eql(u8, scenario, "pool")) {
         try runPool(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "dsn")) {
+        try runDsn(allocator, io);
     } else {
         std.debug.print("usage: smoke_connect [happy|ping|wrong-pass|unreachable|wrong-host|query-bytes]\n", .{});
         return error.UnknownScenario;
     }
+}
+
+fn runDsn(allocator: std.mem.Allocator, io: std.Io) !void {
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const result = try clickzig.fromUri(
+        "clickhouse://default:test@127.0.0.1:9000/default?client_name=smoke-dsn",
+        arena.allocator(),
+        .{
+            .control_allocator = allocator,
+            .read_buffer_size = 64 * 1024,
+            .write_buffer_size = 4 * 1024,
+        },
+    );
+    const client = try clickzig.Client.connectTcp(result.config, io, null, null);
+    defer client.close();
+    try client.ping(null);
+    std.debug.print("[dsn] connected via DSN; client_name={s}\n", .{result.config.client_name.?});
+    std.debug.print("[dsn] OK\n", .{});
 }
 
 fn runPool(allocator: std.mem.Allocator, io: std.Io) !void {
