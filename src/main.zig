@@ -30,6 +30,9 @@ pub const settings = @import("settings.zig");
 pub const column = @import("column.zig");
 pub const block = @import("block.zig");
 pub const result_stream = @import("result_stream.zig");
+pub const pool = @import("pool.zig");
+pub const Pool = pool.Pool;
+pub const PoolOptions = pool.Options;
 
 pub const ClientError = cherror.ClientError;
 pub const ServerError = cherror.ServerError;

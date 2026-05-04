@@ -41,10 +41,37 @@ pub fn main(init: std.process.Init) !void {
         try runNullableRoundtrip(allocator, io);
     } else if (std.mem.eql(u8, scenario, "complex-types")) {
         try runComplexTypes(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "pool")) {
+        try runPool(allocator, io);
     } else {
         std.debug.print("usage: smoke_connect [happy|ping|wrong-pass|unreachable|wrong-host|query-bytes]\n", .{});
         return error.UnknownScenario;
     }
+}
+
+fn runPool(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pool = try clickzig.Pool.init(allocator, io, baseConfig(allocator), .{ .max_size = 4 });
+    defer pool.deinit();
+
+    // Acquire 3 distinct clients in parallel-ish (no real threads needed
+    // for the smoke; just sequential acquire+ping+release with a peek
+    // at live_count to confirm pool bookkeeping).
+    const c1 = try pool.acquire(null);
+    try c1.ping(null);
+    const c2 = try pool.acquire(null);
+    try c2.ping(null);
+    std.debug.print("[pool] live={d} idle={d} after 2 acquires\n", .{ pool.liveCount(), pool.idleCount() });
+    pool.release(c1);
+    pool.release(c2);
+    std.debug.print("[pool] live={d} idle={d} after release\n", .{ pool.liveCount(), pool.idleCount() });
+
+    // Re-acquire — should hit the idle slot, no new dial.
+    const c3 = try pool.acquire(null);
+    try c3.ping(null);
+    pool.release(c3);
+    std.debug.print("[pool] live={d} idle={d} after re-acquire+release (should be 2/2)\n", .{ pool.liveCount(), pool.idleCount() });
+    if (pool.liveCount() != 2) return error.PoolBookkeepingMismatch;
+    std.debug.print("[pool] OK\n", .{});
 }
 
 fn runComplexTypes(allocator: std.mem.Allocator, io: std.Io) !void {

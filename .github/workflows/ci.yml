@@ -73,3 +73,5 @@ jobs:
         run: zig build smoke -- nullable-roundtrip
       - name: smoke complex-types
         run: zig build smoke -- complex-types
+      - name: smoke pool
+        run: zig build smoke -- pool
