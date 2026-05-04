@@ -109,17 +109,14 @@ pub const TcpTransport = struct {
         const write_buf = allocator.alloc(u8, opts.write_buffer_size) catch return error.OutOfMemory;
         errdefer allocator.free(write_buf);
 
-        // std.Io.Threaded on Windows panics if options.timeout != .none (as of
-        // Zig 0.16.0). Pass .none and rely on the OS TCP connect timeout for
-        // now; per-call dial_timeout_ms enforcement lands in v0.17 once the
-        // underlying backend wires it up. POSIX backends already support it.
-        const timeout: Io.Timeout = if (opts.dial_timeout_ms == 0 or @import("builtin").os.tag == .windows)
-            .none
-        else
-            .{ .duration = .{
-                .raw = .fromMilliseconds(@intCast(opts.dial_timeout_ms)),
-                .clock = .awake,
-            } };
+        // std.Io.Threaded panics on both Windows (netConnectIpWindows) and
+        // POSIX (netConnectIpPosix) if options.timeout != .none — both have
+        // a `@panic("TODO implement ...")` guard as of Zig 0.16.0. We pass
+        // .none everywhere and rely on the OS TCP connect timeout. Per-call
+        // `dial_timeout_ms` enforcement lands in v0.17 alongside Io.Uring
+        // and the proper per-op timeout wiring.
+        _ = opts.dial_timeout_ms;
+        const timeout: Io.Timeout = .none;
 
         const stream: Io.net.Stream = blk: {
             // Try IP literal first (cheap, no DNS).

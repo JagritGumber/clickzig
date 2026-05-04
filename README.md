@@ -2,7 +2,7 @@
 
 A native-protocol ClickHouse client for Zig 0.16+, designed for low-latency analytical and quant workloads.
 
-current version: **v0.16.0**
+current version: **v0.16.1**
 
 ## what it is
 
@@ -28,7 +28,7 @@ In your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .clickzig = .{
-        .url = "https://github.com/JagritGumber/clickzig/archive/refs/tags/v0.16.0.tar.gz",
+        .url = "https://github.com/JagritGumber/clickzig/archive/refs/tags/v0.16.1.tar.gz",
         // .hash will be filled in by `zig fetch`
     },
 },
