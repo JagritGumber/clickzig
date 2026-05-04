@@ -125,6 +125,68 @@ fn readFixed(comptime T: type, reader: *std.Io.Reader, allocator: std.mem.Alloca
     return slice;
 }
 
+/// Write a Column to the wire in the same Native format the server
+/// emits. Caller must have already written the column header (name +
+/// type + has_custom_serialization byte) — this function writes only
+/// the data payload. Symmetric to `readColumn`.
+pub fn writeColumn(writer: *std.Io.Writer, col: Column) std.Io.Writer.Error!void {
+    switch (col) {
+        .String => |rows| {
+            for (rows) |row| try wire.writeStringBinary(writer, row);
+        },
+        inline else => |slice| try writer.writeAll(std.mem.sliceAsBytes(slice)),
+    }
+}
+
+/// Resolve a TypeId back to its canonical wire type name. Round-trip
+/// is lossy for type-aliases (Date -> UInt16 -> "UInt16"; DateTime ->
+/// UInt32 -> "UInt32") — callers needing the original type name (for
+/// INSERTs into a Date column) must pass the type string explicitly
+/// via `InsertColumn.type_name`.
+pub fn canonicalTypeName(tid: TypeId) []const u8 {
+    return switch (tid) {
+        .UInt8 => "UInt8",
+        .UInt16 => "UInt16",
+        .UInt32 => "UInt32",
+        .UInt64 => "UInt64",
+        .Int8 => "Int8",
+        .Int16 => "Int16",
+        .Int32 => "Int32",
+        .Int64 => "Int64",
+        .Float32 => "Float32",
+        .Float64 => "Float64",
+        .String => "String",
+    };
+}
+
+test "writeColumn UInt32 round-trips through readColumn" {
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const original = [_]u32{ 7, 13, 0xFFFFFFFF };
+    const col_in: Column = .{ .UInt32 = @constCast(&original) };
+    try writeColumn(&w, col_in);
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col_out = try readColumn(&r, testing.allocator, "UInt32", 3);
+    defer col_out.deinit(testing.allocator);
+    try testing.expectEqualSlices(u32, &original, col_out.UInt32);
+}
+
+test "writeColumn String round-trips" {
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var rows = [_][]u8{ @constCast("a"), @constCast("bb"), @constCast("") };
+    const col_in: Column = .{ .String = &rows };
+    try writeColumn(&w, col_in);
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col_out = try readColumn(&r, testing.allocator, "String", 3);
+    defer col_out.deinit(testing.allocator);
+    try testing.expectEqualStrings("a", col_out.String[0]);
+    try testing.expectEqualStrings("bb", col_out.String[1]);
+    try testing.expectEqualStrings("", col_out.String[2]);
+}
+
 const testing = std.testing;
 
 test "typeIdFromName resolves known primitives" {

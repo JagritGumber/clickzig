@@ -152,30 +152,40 @@ pub const ResultStream = struct {
     }
 
     fn readProgress(self: *ResultStream) !Progress {
+        return readProgressBody(self.reader, self.server_revision);
+    }
+    fn readProfileInfo(self: *ResultStream) !ProfileInfo {
+        return readProfileInfoBody(self.reader);
+    }
+    fn readTableColumns(self: *ResultStream) !TableColumns {
+        return readTableColumnsBody(self.reader, self.allocator);
+    }
+
+    pub fn readProgressBody(reader: *std.Io.Reader, server_revision: u64) !Progress {
         var p: Progress = .{};
-        p.read_rows = try varint.readVarUInt(self.reader, u64);
-        p.read_bytes = try varint.readVarUInt(self.reader, u64);
-        p.total_rows_to_read = try varint.readVarUInt(self.reader, u64);
-        if (self.server_revision >= protocol.Revision.WITH_TOTAL_ROWS_IN_PROGRESS) {
-            p.total_bytes_to_read = try varint.readVarUInt(self.reader, u64);
+        p.read_rows = try varint.readVarUInt(reader, u64);
+        p.read_bytes = try varint.readVarUInt(reader, u64);
+        p.total_rows_to_read = try varint.readVarUInt(reader, u64);
+        if (server_revision >= protocol.Revision.WITH_TOTAL_ROWS_IN_PROGRESS) {
+            p.total_bytes_to_read = try varint.readVarUInt(reader, u64);
         }
-        if (self.server_revision >= protocol.Revision.WITH_CLIENT_WRITE_INFO) {
-            p.written_rows = try varint.readVarUInt(self.reader, u64);
-            p.written_bytes = try varint.readVarUInt(self.reader, u64);
+        if (server_revision >= protocol.Revision.WITH_CLIENT_WRITE_INFO) {
+            p.written_rows = try varint.readVarUInt(reader, u64);
+            p.written_bytes = try varint.readVarUInt(reader, u64);
         }
-        if (self.server_revision >= protocol.Revision.WITH_SERVER_QUERY_TIME_IN_PROGRESS) {
-            p.elapsed_ns = try varint.readVarUInt(self.reader, u64);
+        if (server_revision >= protocol.Revision.WITH_SERVER_QUERY_TIME_IN_PROGRESS) {
+            p.elapsed_ns = try varint.readVarUInt(reader, u64);
         }
         return p;
     }
 
-    fn readProfileInfo(self: *ResultStream) !ProfileInfo {
-        const rows = try varint.readVarUInt(self.reader, u64);
-        const blocks = try varint.readVarUInt(self.reader, u64);
-        const bytes = try varint.readVarUInt(self.reader, u64);
-        const applied = (try self.reader.takeByte()) != 0;
-        const rows_bl = try varint.readVarUInt(self.reader, u64);
-        const calc = (try self.reader.takeByte()) != 0;
+    pub fn readProfileInfoBody(reader: *std.Io.Reader) !ProfileInfo {
+        const rows = try varint.readVarUInt(reader, u64);
+        const blocks = try varint.readVarUInt(reader, u64);
+        const bytes = try varint.readVarUInt(reader, u64);
+        const applied = (try reader.takeByte()) != 0;
+        const rows_bl = try varint.readVarUInt(reader, u64);
+        const calc = (try reader.takeByte()) != 0;
         return .{
             .rows = rows,
             .blocks = blocks,
@@ -186,10 +196,10 @@ pub const ResultStream = struct {
         };
     }
 
-    fn readTableColumns(self: *ResultStream) !TableColumns {
-        const table_name = try wire.readStringOwned(self.reader, self.allocator, wire.MAX_DEFAULT_STRING);
-        errdefer self.allocator.free(table_name);
-        const cols_meta = try wire.readStringOwned(self.reader, self.allocator, wire.MAX_QUERY_STRING);
+    pub fn readTableColumnsBody(reader: *std.Io.Reader, allocator: std.mem.Allocator) !TableColumns {
+        const table_name = try wire.readStringOwned(reader, allocator, wire.MAX_DEFAULT_STRING);
+        errdefer allocator.free(table_name);
+        const cols_meta = try wire.readStringOwned(reader, allocator, wire.MAX_QUERY_STRING);
         return .{ .table_name = table_name, .columns_metadata = cols_meta };
     }
 

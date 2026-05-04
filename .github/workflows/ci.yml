@@ -67,3 +67,5 @@ jobs:
         run: zig build smoke -- query-bytes
       - name: smoke query-mixed
         run: zig build smoke -- query-mixed
+      - name: smoke insert-roundtrip
+        run: zig build smoke -- insert-roundtrip

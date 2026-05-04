@@ -35,10 +35,84 @@ pub fn main(init: std.process.Init) !void {
         try runQueryBytes(allocator, io);
     } else if (std.mem.eql(u8, scenario, "query-mixed")) {
         try runQueryMixed(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "insert-roundtrip")) {
+        try runInsertRoundtrip(allocator, io);
     } else {
         std.debug.print("usage: smoke_connect [happy|ping|wrong-pass|unreachable|wrong-host|query-bytes]\n", .{});
         return error.UnknownScenario;
     }
+}
+
+fn runInsertRoundtrip(allocator: std.mem.Allocator, io: std.Io) !void {
+    // Create a temp Memory-engine table, INSERT 3 rows, SELECT them back,
+    // verify exact value match. Memory engine drops the table when the
+    // server restarts so no cleanup needed across runs.
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    defer client.close();
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+
+    // Drop+create.
+    {
+        var s = try client.query("DROP TABLE IF EXISTS smoke_roundtrip", arena.allocator(), null, .{});
+        while (try s.next()) |p| switch (p) {
+            .end_of_stream => break,
+            .exception => |e| { std.debug.print("[insert] drop failed: {s}\n", .{e.message}); return error.SetupFailed; },
+            else => {},
+        };
+    }
+    {
+        var s = try client.query("CREATE TABLE smoke_roundtrip (id UInt32, label String) ENGINE = Memory", arena.allocator(), null, .{});
+        while (try s.next()) |p| switch (p) {
+            .end_of_stream => break,
+            .exception => |e| { std.debug.print("[insert] create failed: {s}\n", .{e.message}); return error.SetupFailed; },
+            else => {},
+        };
+    }
+
+    // INSERT 3 rows.
+    var ids = [_]u32{ 100, 200, 300 };
+    var labels = [_][]u8{ @constCast("alpha"), @constCast("beta"), @constCast("gamma") };
+    const cols = [_]clickzig.block.InsertColumn{
+        .{ .name = "id", .type_name = "UInt32", .data = .{ .UInt32 = &ids } },
+        .{ .name = "label", .type_name = "String", .data = .{ .String = &labels } },
+    };
+    try client.insert(
+        "INSERT INTO smoke_roundtrip (id, label) FORMAT Native",
+        "",
+        3,
+        &cols,
+        arena.allocator(),
+        null,
+        .{ .query_id = "smoke-insert" },
+    );
+    std.debug.print("[insert] inserted 3 rows\n", .{});
+
+    // SELECT them back ordered.
+    var s = try client.query("SELECT id, label FROM smoke_roundtrip ORDER BY id", arena.allocator(), null, .{});
+    var rows_seen: u32 = 0;
+    while (try s.next()) |p| switch (p) {
+        .data => |b| {
+            if (b.num_rows == 0) continue;
+            const ids_back = b.columns[0].column.UInt32;
+            const labels_back = b.columns[1].column.String;
+            var i: usize = 0;
+            while (i < b.num_rows) : (i += 1) {
+                std.debug.print("[insert] read back: id={d} label={s}\n", .{ ids_back[i], labels_back[i] });
+                if (ids_back[i] != ids[rows_seen + i]) return error.InsertMismatch;
+                if (!std.mem.eql(u8, labels_back[i], labels[rows_seen + i])) return error.InsertMismatch;
+            }
+            rows_seen += @intCast(b.num_rows);
+        },
+        .end_of_stream => break,
+        .exception => |e| { std.debug.print("[insert] select failed: {s}\n", .{e.message}); return error.QueryFailed; },
+        else => {},
+    };
+    if (rows_seen != 3) {
+        std.debug.print("[insert] FAIL: expected 3 rows back, got {d}\n", .{rows_seen});
+        return error.UnexpectedRowCount;
+    }
+    std.debug.print("[insert] OK: 3 rows round-tripped exactly\n", .{});
 }
 
 fn runQueryMixed(allocator: std.mem.Allocator, io: std.Io) !void {

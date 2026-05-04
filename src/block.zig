@@ -72,6 +72,53 @@ pub const Error = error{
     UnknownBlockInfoTag,
 };
 
+/// One column to insert: name + ClickHouse type string + the column data.
+/// The type-name string MUST exactly match the server's column type
+/// declaration ("DateTime('UTC')", "Date", "Nullable(Int32)", etc.) —
+/// the canonical TypeId-derived name from `column.canonicalTypeName`
+/// is lossy for aliases. For Date/DateTime/Enum columns, pass the
+/// original type-name explicitly.
+pub const InsertColumn = struct {
+    name: []const u8,
+    type_name: []const u8,
+    data: column_mod.Column,
+};
+
+/// Write a fully-populated Block (table_name + BlockInfo + columns).
+/// Symmetric to `readBlock`. Used by the INSERT path; the SELECT-side
+/// `writeEmptyDataTerminator` in query.zig is the zero-column variant
+/// of this for terminating SELECTs.
+pub fn writeBlock(
+    writer: *std.Io.Writer,
+    table_name: []const u8,
+    info: BlockInfo,
+    num_rows: u64,
+    columns: []const InsertColumn,
+    server_revision: u64,
+) std.Io.Writer.Error!void {
+    try wire.writeStringBinary(writer, table_name);
+    if (server_revision >= protocol.Revision.WITH_BLOCK_INFO) {
+        // Field 1: u8 is_overflows
+        try varint.writeVarUInt(writer, 1);
+        try writer.writeByte(@intFromBool(info.is_overflows));
+        // Field 2: i32 bucket_num
+        try varint.writeVarUInt(writer, 2);
+        try writer.writeInt(i32, info.bucket_num, .little);
+        // Field 0: end
+        try varint.writeVarUInt(writer, 0);
+    }
+    try varint.writeVarUInt(writer, columns.len);
+    try varint.writeVarUInt(writer, num_rows);
+    for (columns) |col| {
+        try wire.writeStringBinary(writer, col.name);
+        try wire.writeStringBinary(writer, col.type_name);
+        if (server_revision >= protocol.Revision.WITH_CUSTOM_SERIALIZATION) {
+            try writer.writeByte(0); // we never emit custom-serialization columns
+        }
+        try column_mod.writeColumn(writer, col.data);
+    }
+}
+
 pub fn readBlock(
     reader: *std.Io.Reader,
     allocator: std.mem.Allocator,
@@ -179,6 +226,27 @@ test "readBlock decodes an empty (0-row 0-col) block" {
     const block = try readBlock(&r, testing.allocator, protocol.CLIENT_REVISION);
     defer block.deinit();
     try testing.expect(block.isEmpty());
+}
+
+test "writeBlock + readBlock round-trip a 2-col 3-row block" {
+    const ally = testing.allocator;
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var ids = [_]u32{ 1, 2, 3 };
+    var names = [_][]u8{ @constCast("alpha"), @constCast("beta"), @constCast("gamma") };
+    const cols = [_]InsertColumn{
+        .{ .name = "id", .type_name = "UInt32", .data = .{ .UInt32 = &ids } },
+        .{ .name = "label", .type_name = "String", .data = .{ .String = &names } },
+    };
+    try writeBlock(&w, "", .{}, 3, &cols, protocol.CLIENT_REVISION);
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const block = try readBlock(&r, ally, protocol.CLIENT_REVISION);
+    defer block.deinit();
+    try testing.expectEqual(@as(u64, 3), block.num_rows);
+    try testing.expectEqual(@as(usize, 2), block.columns.len);
+    try testing.expectEqualSlices(u32, &ids, block.columns[0].column.UInt32);
+    try testing.expectEqualStrings("beta", block.columns[1].column.String[1]);
 }
 
 test "readBlock rejects custom_serialization byte != 0" {

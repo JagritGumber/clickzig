@@ -42,6 +42,7 @@ const cherror = @import("cherror.zig");
 const query_mod = @import("query.zig");
 const client_info_mod = @import("client_info.zig");
 const result_stream_mod = @import("result_stream.zig");
+const block_mod = @import("block.zig");
 
 pub const ServerInfo = hello.ServerInfo;
 
@@ -457,7 +458,167 @@ pub const Client = struct {
             },
         };
     }
+
+    /// INSERT entry point. The caller pre-builds typed columns with their
+    /// canonical type-names and passes them in. We send the Query packet,
+    /// drain the server's schema-block + any ProfileEvents, write the data
+    /// block, write the empty terminator, then drain to EndOfStream.
+    ///
+    /// `query_text` must be a complete `INSERT INTO table (col1, col2, ...)`
+    /// statement — the server uses it to validate column types before
+    /// accepting our data block.
+    pub fn insert(
+        self: *Client,
+    query_text: []const u8,
+    table_name: []const u8,
+    num_rows: u64,
+    columns: []const block_mod.InsertColumn,
+    query_allocator: std.mem.Allocator,
+    cancel: ?*const std.atomic.Value(bool),
+    opts: query_mod.QueryOptions,
+) QueryError!void {
+    try self.sendQuery(query_text, cancel, opts);
+    const negotiated = self.server_info.negotiated(protocol.CLIENT_REVISION);
+
+    // Drain the server's pre-data packets — at minimum the schema block
+    // (Data with 0 rows). Server may also interleave Progress / Log /
+    // ProfileEvents before signalling readiness for our data.
+    var schema_seen = false;
+    while (!schema_seen) {
+        const pkt = wire.readServerPacketId(self.transport.reader()) catch |e| {
+            self.is_broken = true;
+            self.state = .broken;
+            return mapReadErrQuery(e);
+        };
+        switch (pkt) {
+            .Data => {
+                // Discard the schema block — we trust the user's column
+                // types match. A future hardening pass could validate here.
+                const block = block_mod.readBlock(self.transport.reader(), query_allocator, negotiated) catch |e| {
+                    self.is_broken = true;
+                    self.state = .broken;
+                    return mapReadErrQuery(e);
+                };
+                block.deinit();
+                schema_seen = true;
+            },
+            .Exception => {
+                const exc = @import("exception.zig").readException(self.transport.reader(), query_allocator) catch |e| {
+                    self.is_broken = true;
+                    self.state = .broken;
+                    return mapReadErrQuery(e);
+                };
+                exc.deinit();
+                self.is_broken = true;
+                self.state = .broken;
+                return error.ProtocolError;
+            },
+            // Server may interleave Log entries (block-shaped) and
+            // Progress packets before sending the schema Data block.
+            // Drain by reading their bodies and discarding.
+            .Log, .ProfileEvents, .Totals, .Extremes => {
+                const blk = block_mod.readBlock(self.transport.reader(), query_allocator, negotiated) catch |e| {
+                    self.is_broken = true;
+                    self.state = .broken;
+                    return mapReadErrQuery(e);
+                };
+                blk.deinit();
+            },
+            .Progress => {
+                _ = result_stream_mod.ResultStream.readProgressBody(self.transport.reader(), negotiated) catch |e| {
+                    self.is_broken = true;
+                    self.state = .broken;
+                    return mapReadErrQuery(e);
+                };
+            },
+            .ProfileInfo => {
+                _ = result_stream_mod.ResultStream.readProfileInfoBody(self.transport.reader()) catch |e| {
+                    self.is_broken = true;
+                    self.state = .broken;
+                    return mapReadErrQuery(e);
+                };
+            },
+            .TableColumns => {
+                const tc = result_stream_mod.ResultStream.readTableColumnsBody(self.transport.reader(), query_allocator) catch |e| {
+                    self.is_broken = true;
+                    self.state = .broken;
+                    return mapReadErrQuery(e);
+                };
+                tc.deinit(query_allocator);
+            },
+            else => {
+                self.is_broken = true;
+                self.state = .broken;
+                return error.ProtocolError;
+            },
+        }
+    }
+
+    // Write our data block. The packet ID prefix is required — without
+    // it the server reads the first body byte as a packet ID and bails
+    // ("Unexpected packet Hello received from client" if table_name=0-len).
+    wire.writeClientPacketId(self.transport.writer(), .Data) catch |e| {
+        self.is_broken = true;
+        self.state = .broken;
+        return mapWriteErrQuery(e);
+    };
+    block_mod.writeBlock(self.transport.writer(), table_name, .{}, num_rows, columns, negotiated) catch |e| {
+        self.is_broken = true;
+        self.state = .broken;
+        return mapWriteErrQuery(e);
+    };
+    // Empty terminator block signals end-of-INSERT to the server.
+    query_mod.writeEmptyDataTerminator(self.transport.writer(), negotiated) catch |e| {
+        self.is_broken = true;
+        self.state = .broken;
+        return mapWriteErrQuery(e);
+    };
+    self.transport.writer().flush() catch |e| {
+        self.is_broken = true;
+        self.state = .broken;
+        return mapWriteErrQuery(e);
+    };
+
+    // Drain server response through EndOfStream via a temporary stream.
+    var stream: result_stream_mod.ResultStream = .{
+        .reader = self.transport.reader(),
+        .allocator = query_allocator,
+        .server_revision = negotiated,
+        .client_state = .{
+            .state = self,
+            .is_broken = &self.is_broken,
+            .set_ready = setReadyImpl,
+            .set_broken = setBrokenImpl,
+        },
+    };
+    while (try mapStreamErr(stream.next())) |packet| switch (packet) {
+        .end_of_stream => break,
+        .exception => |e| {
+            e.deinit();
+            return error.ProtocolError;
+        },
+        .data, .totals, .extremes, .log, .profile_events => |b| b.deinit(),
+        .table_columns => |t| t.deinit(query_allocator),
+        .progress, .profile_info => {},
+    };
+    }
 };
+
+fn mapReadErrQuery(e: anyerror) QueryError {
+    return switch (e) {
+        error.ReadFailed, error.EndOfStream => error.ConnectionFailed,
+        error.OutOfMemory => error.OutOfMemory,
+        error.Canceled, error.Cancelled => error.Cancelled,
+        else => error.ProtocolError,
+    };
+}
+
+fn mapStreamErr(r: anytype) QueryError!@typeInfo(@TypeOf(r)).error_union.payload {
+    return r catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.ProtocolError,
+    };
+}
 
 fn setReadyImpl(state: *anyopaque) void {
     const c: *Client = @ptrCast(@alignCast(state));
