@@ -2,28 +2,46 @@
 
 A native-protocol ClickHouse client for Zig 0.16, designed for low-latency analytical and quant workloads.
 
-**Status: in development.** Not yet released. The first tagged release will be `v0.16.0`, mirroring Zig 0.16.0, and will ship the complete client (handshake + query + insert + compression + connection pool) as a single coherent package — no incremental tags between now and then. Track `main` if you want to see progress.
+**Status: in development, approaching v0.16.0 tag.** All core paths land before the first tag — no incremental versions. Track `main` for progress.
 
 ## what it is
 
-clickzig speaks the ClickHouse native TCP protocol (port 9000) directly from Zig. Architecturally locked for predictable allocation, swap-able I/O backends, and explicit cancellation.
+clickzig speaks the ClickHouse native TCP protocol (port 9000 / 9440 TLS) directly from Zig. Architecturally locked for predictable allocation, swap-able I/O backends, and explicit cancellation.
 
 ## what works on `main` today
 
-- Connect / handshake against ClickHouse 26.x (ServerHello parsing through revision 54_466 with full revision-gated reads)
-- Ping for liveness
-- Lifecycle observability via `Config.on_event`
-- Pluggable `Transport` (built-in `TcpTransport`, swap in your own)
+**Lifecycle**
+- Handshake against ClickHouse 26.x (ServerHello parsing through revision 54_466)
+- Ping / Pong liveness
+- Observability via `Config.on_event` (every state transition fires a callback)
 - Typed `ConnectError` with `Diagnostics` carrying parsed `ServerError`
+- Pluggable `Transport` (built-in `TcpTransport`, `TlsTransport`, or swap in your own)
 
-## what's still being built before v0.16.0 tags
+**Queries + INSERT**
+- `Client.query()` returns a `ResultStream` iterator over server packets
+- Block decoder for SELECT responses (Data + Progress + ProfileInfo + ProfileEvents + Log + Totals + Extremes + TableColumns)
+- `Client.insert()` for bulk INSERT in Native format
 
-- Query / Data / Block parsing + iterator-shaped `Client.query`
-- Insert path with block-buffered builder
-- LZ4 + ZSTD compression
-- Connection pool
-- TLS (separate-port style on 9440)
-- DSN constructor
+**Column types**
+- Primitives: UInt8/16/32/64/128, Int8/16/32/64/128, Float32/64, String, Bool
+- Composite: Nullable(T), Array(T), FixedString(N), UUID
+- Aliases: Date, Date32, DateTime, DateTime64, Enum8, Enum16, IPv4, IPv6
+- Decimal(P, S) → Int32/Int64/Int128 based on precision (Decimal32/64/128 explicit aliases too)
+
+**Pool + DSN**
+- `Pool` with thread-safe acquire/release, broken-discard, optional max-lifetime expiry
+- `clickzig.fromUri("clickhouse://user:pw@host:port/db?key=val")` → Config
+
+**TLS**
+- `TlsTransport` over `TcpTransport`, supports `.insecure` (dev) or `.system_ca` (production) verify modes
+
+## known gaps before v0.16.0
+
+- **Compression (LZ4 / ZSTD)** — server replies are uncompressed by default; client always negotiates `CompressionEnabled.Disable`. Lands once CityHash 1.0.2 frozen + LZ4 codec are vendored.
+- **Decimal256** — needs i256; defer alongside compression work.
+- **Tuple / Map / LowCardinality** — column types not yet decoded.
+- **Async via `std.Io` fibers** — current API is sync.
+- **Parameterised queries** — bindings via `?`/`{name:Type}` placeholders not yet implemented.
 
 ## design decisions worth knowing up front
 
@@ -40,7 +58,7 @@ Not installable yet — no tagged release. Once `v0.16.0` ships, the install sni
 
 To preview from `main`, clone the repo and `@import("clickzig")` from a relative path or file URL.
 
-## quick start
+## quick start: query
 
 ```zig
 const std = @import("std");
@@ -53,19 +71,66 @@ pub fn main(init: std.process.Init) !void {
         .write_buffer_size = 4 * 1024,
         .username = "default",
         .password = "test",
-        .client_name = "my-app/v1",
     }, init.io, null, null);
     defer client.close();
 
-    std.debug.print("connected to {s} {d}.{d} (rev {d})\n", .{
-        client.server_info.name,
-        client.server_info.major_version,
-        client.server_info.minor_version,
-        client.server_info.revision,
-    });
+    var arena: std.heap.ArenaAllocator = .init(init.gpa);
+    defer arena.deinit();
 
-    try client.ping(null);
+    var stream = try client.query("SELECT number, number * 2 FROM numbers(5)", arena.allocator(), null, .{});
+    while (try stream.next()) |packet| switch (packet) {
+        .data => |b| {
+            for (0..b.num_rows) |i| std.debug.print("{d} -> {d}\n", .{ b.columns[0].column.UInt64[i], b.columns[1].column.UInt64[i] });
+        },
+        .end_of_stream => break,
+        else => {},
+    };
 }
+```
+
+## quick start: insert
+
+```zig
+var ids = [_]u32{ 1, 2, 3 };
+var labels = [_][]u8{ @constCast("alpha"), @constCast("beta"), @constCast("gamma") };
+const cols = [_]clickzig.block.InsertColumn{
+    .{ .name = "id", .type_name = "UInt32", .data = .{ .UInt32 = &ids } },
+    .{ .name = "label", .type_name = "String", .data = .{ .String = &labels } },
+};
+try client.insert(
+    "INSERT INTO my_table (id, label) FORMAT Native",
+    "",
+    3,
+    &cols,
+    arena.allocator(),
+    null,
+    .{},
+);
+```
+
+## quick start: pool
+
+```zig
+const pool = try clickzig.Pool.init(init.gpa, init.io, config, .{ .max_size = 16 });
+defer pool.deinit();
+
+const client = try pool.acquire(null);
+defer pool.release(client);
+try client.ping(null);
+```
+
+## quick start: dsn
+
+```zig
+var arena: std.heap.ArenaAllocator = .init(init.gpa);
+defer arena.deinit();
+const result = try clickzig.fromUri(
+    "clickhouse://default:test@127.0.0.1:9000/analytics?client_name=ingest",
+    arena.allocator(),
+    .{ .control_allocator = init.gpa, .read_buffer_size = 64 * 1024, .write_buffer_size = 4 * 1024 },
+);
+const client = try clickzig.Client.connectTcp(result.config, init.io, null, null);
+defer client.close();
 ```
 
 ## examples

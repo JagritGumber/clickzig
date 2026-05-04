@@ -474,7 +474,7 @@ test "readColumn String round-trips multibyte rows" {
 
 test "readColumn rejects unknown type" {
     var r: std.Io.Reader = .fixed(&[_]u8{});
-    // Decimal/Map/Tuple/IPv4/IPv6 — pick one that v0.16.0 still doesn't
-    // decode. Update when support lands.
-    try testing.expectError(error.UnsupportedColumnType, readColumn(&r, testing.allocator, "Decimal(18, 4)", 0));
+    // Tuple/Map/LowCardinality — v0.16.0 still doesn't decode these.
+    // Update the string when support lands.
+    try testing.expectError(error.UnsupportedColumnType, readColumn(&r, testing.allocator, "Tuple(UInt8, String)", 0));
 }
