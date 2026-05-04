@@ -65,3 +65,5 @@ jobs:
         run: zig build smoke -- wrong-host
       - name: smoke query-bytes
         run: zig build smoke -- query-bytes
+      - name: smoke query-mixed
+        run: zig build smoke -- query-mixed

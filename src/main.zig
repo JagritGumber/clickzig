@@ -27,11 +27,19 @@ pub const protocol = @import("protocol.zig");
 pub const client_info = @import("client_info.zig");
 pub const query = @import("query.zig");
 pub const settings = @import("settings.zig");
+pub const column = @import("column.zig");
+pub const block = @import("block.zig");
+pub const result_stream = @import("result_stream.zig");
 
 pub const ClientError = cherror.ClientError;
 pub const ServerError = cherror.ServerError;
 pub const ClientInfo = client_info.ClientInfo;
 pub const QueryOptions = query.QueryOptions;
+pub const Block = block.Block;
+pub const Column = column.Column;
+pub const Packet = result_stream.Packet;
+pub const Progress = result_stream.Progress;
+pub const ResultStream = result_stream.ResultStream;
 
 const client_mod = @import("client.zig");
 pub const Client = client_mod.Client;

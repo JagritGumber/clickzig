@@ -54,6 +54,7 @@ pub const Revision = struct {
     pub const WITH_PARALLEL_REPLICAS: u64 = 54_453;
     pub const WITH_QUERY_AND_LINE_NUMBERS: u64 = 54_475;
     pub const WITH_QUERY_STAGE: u64 = 54_453;
+    pub const WITH_CUSTOM_SERIALIZATION: u64 = 54_454;
     pub const WITH_INITIAL_QUERY_START_TIME: u64 = 54_449;
     pub const WITH_ADDENDUM: u64 = 54_458;
     pub const WITH_QUOTA_KEY: u64 = 54_458;

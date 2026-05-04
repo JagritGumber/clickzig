@@ -33,22 +33,96 @@ pub fn main(init: std.process.Init) !void {
         try runWrongHost(allocator, io);
     } else if (std.mem.eql(u8, scenario, "query-bytes")) {
         try runQueryBytes(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "query-mixed")) {
+        try runQueryMixed(allocator, io);
     } else {
         std.debug.print("usage: smoke_connect [happy|ping|wrong-pass|unreachable|wrong-host|query-bytes]\n", .{});
         return error.UnknownScenario;
     }
 }
 
-fn runQueryBytes(allocator: std.mem.Allocator, io: std.Io) !void {
-    // Send a Query packet for "SELECT 1" and confirm the server doesn't
-    // disconnect. We don't yet drain the response (next commit's job),
-    // but if the bytes are malformed the server resets the connection
-    // and a follow-up ping fails — that's the cheap end-to-end check.
+fn runQueryMixed(allocator: std.mem.Allocator, io: std.Io) !void {
+    // Multi-row, multi-type result — exercises String + Int64 + Float64
+    // + DateTime decode in one go. `numbers(N)` gives us a deterministic
+    // 4-row generator; the SELECT then casts/labels columns to known
+    // types so the wire response has predictable schema.
     const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
     defer client.close();
-    try client.sendQuery("SELECT 1", null, .{ .query_id = "smoke-query-bytes" });
-    std.debug.print("[query-bytes] sendQuery returned cleanly, state={s}\n", .{@tagName(client.state)});
-    std.debug.print("[query-bytes] (response handling lands in next commit)\n", .{});
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+
+    const sql =
+        \\SELECT
+        \\    toString(number * 100) AS label,
+        \\    toInt64(number) AS n,
+        \\    toFloat64(number) / 3 AS frac,
+        \\    toDateTime('2026-05-04 09:00:00') + number AS ts
+        \\FROM numbers(4)
+    ;
+    var stream = try client.query(sql, arena.allocator(), null, .{ .query_id = "smoke-query-mixed" });
+    var rows_seen: u64 = 0;
+    while (try stream.next()) |packet| switch (packet) {
+        .data => |b| {
+            if (b.num_rows == 0) continue;
+            const labels = b.columns[0].column.String;
+            const ns = b.columns[1].column.Int64;
+            const fracs = b.columns[2].column.Float64;
+            const ts = b.columns[3].column.UInt32;
+            var i: usize = 0;
+            while (i < b.num_rows) : (i += 1) {
+                std.debug.print("[query-mixed] row: label={s} n={d} frac={d:.4} ts={d}\n", .{ labels[i], ns[i], fracs[i], ts[i] });
+            }
+            rows_seen += b.num_rows;
+        },
+        .end_of_stream => break,
+        .exception => |e| {
+            std.debug.print("[query-mixed] server exception: {s}\n", .{e.message});
+            return error.ServerExceptionDuringQuery;
+        },
+        else => {},
+    };
+    if (rows_seen != 4) {
+        std.debug.print("[query-mixed] FAIL: expected 4 rows, got {d}\n", .{rows_seen});
+        return error.UnexpectedRowCount;
+    }
+    std.debug.print("[query-mixed] OK: 4 rows x 4 columns decoded\n", .{});
+}
+
+fn runQueryBytes(allocator: std.mem.Allocator, io: std.Io) !void {
+    // Full round-trip: send "SELECT 1", drain every server packet through
+    // EndOfStream, dump what came back. Verifies wire format end-to-end
+    // including BlockInfo, column header, and primitive column decode.
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    defer client.close();
+
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+
+    var stream = try client.query("SELECT 1", arena.allocator(), null, .{ .query_id = "smoke-query-bytes" });
+    var data_blocks: u32 = 0;
+    var progress_packets: u32 = 0;
+    while (try stream.next()) |packet| switch (packet) {
+        .data => |b| {
+            data_blocks += 1;
+            std.debug.print("[query-bytes] data block: {d} cols x {d} rows\n", .{ b.columns.len, b.num_rows });
+            for (b.columns) |c| {
+                std.debug.print("[query-bytes]   col {s}: {s}\n", .{ c.name, c.type_name });
+                switch (c.column) {
+                    .UInt8 => |s| if (s.len > 0) std.debug.print("[query-bytes]     value[0]={d}\n", .{s[0]}),
+                    else => {},
+                }
+            }
+        },
+        .progress => progress_packets += 1,
+        .end_of_stream => break,
+        .exception => |e| {
+            std.debug.print("[query-bytes] server exception code={d} msg={s}\n", .{ e.code, e.message });
+            return error.ServerExceptionDuringQuery;
+        },
+        else => {},
+    };
+    std.debug.print("[query-bytes] drained: {d} data blocks, {d} progress packets, state={s}\n", .{ data_blocks, progress_packets, @tagName(client.state) });
+    if (client.state != .ready) return error.ClientNotReady;
 }
 
 fn baseConfig(allocator: std.mem.Allocator) clickzig.Config {

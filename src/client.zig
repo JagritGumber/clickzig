@@ -41,6 +41,7 @@ const wire = @import("wire.zig");
 const cherror = @import("cherror.zig");
 const query_mod = @import("query.zig");
 const client_info_mod = @import("client_info.zig");
+const result_stream_mod = @import("result_stream.zig");
 
 pub const ServerInfo = hello.ServerInfo;
 
@@ -429,12 +430,45 @@ pub const Client = struct {
         };
         emit(self.config, .query_sent);
         self.last_used_at_ms = std.Io.Clock.now(.real, self.io).toMilliseconds();
-        // State stays .busy until the next commit's response-drain code
-        // walks the server's packets through to EndOfStream and resets
-        // it. For now callers should treat the Client as busy after this
-        // returns and not issue another sendQuery.
+    }
+
+    /// Send a query and return a `ResultStream` the caller iterates with
+    /// `next()` until it yields `null` (EndOfStream or Exception). The
+    /// `query_allocator` owns every Block, ServerError, and TableColumns
+    /// the stream emits — typical caller pattern is to pass an arena
+    /// that's reset between queries (per quant-ingest hot-path policy).
+    pub fn query(
+        self: *Client,
+        query_text: []const u8,
+        query_allocator: std.mem.Allocator,
+        cancel: ?*const std.atomic.Value(bool),
+        opts: query_mod.QueryOptions,
+    ) QueryError!result_stream_mod.ResultStream {
+        try self.sendQuery(query_text, cancel, opts);
+        return .{
+            .reader = self.transport.reader(),
+            .allocator = query_allocator,
+            .server_revision = self.server_info.negotiated(protocol.CLIENT_REVISION),
+            .client_state = .{
+                .state = self,
+                .is_broken = &self.is_broken,
+                .set_ready = setReadyImpl,
+                .set_broken = setBrokenImpl,
+            },
+        };
     }
 };
+
+fn setReadyImpl(state: *anyopaque) void {
+    const c: *Client = @ptrCast(@alignCast(state));
+    c.state = .ready;
+    c.last_used_at_ms = std.Io.Clock.now(.real, c.io).toMilliseconds();
+}
+
+fn setBrokenImpl(state: *anyopaque) void {
+    const c: *Client = @ptrCast(@alignCast(state));
+    c.state = .broken;
+}
 
 // --- private helpers -------------------------------------------------------
 
