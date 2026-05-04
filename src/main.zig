@@ -24,9 +24,14 @@ const std = @import("std");
 
 pub const cherror = @import("cherror.zig");
 pub const protocol = @import("protocol.zig");
+pub const client_info = @import("client_info.zig");
+pub const query = @import("query.zig");
+pub const settings = @import("settings.zig");
 
 pub const ClientError = cherror.ClientError;
 pub const ServerError = cherror.ServerError;
+pub const ClientInfo = client_info.ClientInfo;
+pub const QueryOptions = query.QueryOptions;
 
 const client_mod = @import("client.zig");
 pub const Client = client_mod.Client;

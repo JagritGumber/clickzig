@@ -31,10 +31,24 @@ pub fn main(init: std.process.Init) !void {
         try runUnreachable(allocator, io);
     } else if (std.mem.eql(u8, scenario, "wrong-host")) {
         try runWrongHost(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "query-bytes")) {
+        try runQueryBytes(allocator, io);
     } else {
-        std.debug.print("usage: smoke_connect [happy|ping|wrong-pass|unreachable|wrong-host]\n", .{});
+        std.debug.print("usage: smoke_connect [happy|ping|wrong-pass|unreachable|wrong-host|query-bytes]\n", .{});
         return error.UnknownScenario;
     }
+}
+
+fn runQueryBytes(allocator: std.mem.Allocator, io: std.Io) !void {
+    // Send a Query packet for "SELECT 1" and confirm the server doesn't
+    // disconnect. We don't yet drain the response (next commit's job),
+    // but if the bytes are malformed the server resets the connection
+    // and a follow-up ping fails — that's the cheap end-to-end check.
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    defer client.close();
+    try client.sendQuery("SELECT 1", null, .{ .query_id = "smoke-query-bytes" });
+    std.debug.print("[query-bytes] sendQuery returned cleanly, state={s}\n", .{@tagName(client.state)});
+    std.debug.print("[query-bytes] (response handling lands in next commit)\n", .{});
 }
 
 fn baseConfig(allocator: std.mem.Allocator) clickzig.Config {

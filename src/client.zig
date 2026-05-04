@@ -39,6 +39,8 @@ const hello = @import("hello.zig");
 const addendum = @import("addendum.zig");
 const wire = @import("wire.zig");
 const cherror = @import("cherror.zig");
+const query_mod = @import("query.zig");
+const client_info_mod = @import("client_info.zig");
 
 pub const ServerInfo = hello.ServerInfo;
 
@@ -53,8 +55,17 @@ pub const Event = enum {
     server_exception_received,
     ping_sent,
     pong_received,
+    query_sent,
     closing,
     closed,
+};
+
+pub const QueryError = error{
+    ConnectionFailed,
+    ProtocolError,
+    Cancelled,
+    OutOfMemory,
+    ClientNotReady,
 };
 
 pub const Diagnostics = struct {
@@ -375,6 +386,54 @@ pub const Client = struct {
     pub fn isReusable(self: *const Client) bool {
         return !self.is_broken and self.state == .ready;
     }
+
+    /// Send a Query packet plus the empty Data terminator. Does NOT
+    /// drain the response — that's the next commit's job. Today's value
+    /// is purely "does the server accept our bytes without disconnecting"
+    /// so we can validate wire format end-to-end before building the
+    /// response decoder on top.
+    ///
+    /// State transition: .ready -> .busy. Caller must subsequently
+    /// drive the result-stream reader (also coming next commit) which
+    /// will land state back at .ready on EndOfStream.
+    pub fn sendQuery(
+        self: *Client,
+        query_text: []const u8,
+        cancel: ?*const std.atomic.Value(bool),
+        opts: query_mod.QueryOptions,
+    ) QueryError!void {
+        if (self.state != .ready) return error.ClientNotReady;
+        if (cancellationRequested(cancel)) return error.Cancelled;
+        self.state = .busy;
+
+        const negotiated = self.server_info.negotiated(protocol.CLIENT_REVISION);
+        const info: client_info_mod.ClientInfo = .{
+            .client_name = self.config.client_name orelse protocol.ClientName,
+            .initial_query_start_time_microseconds = @intCast(@max(0, std.Io.Clock.now(.real, self.io).toMilliseconds() * std.time.us_per_ms)),
+        };
+
+        query_mod.writeClientQuery(self.transport.writer(), query_text, info, negotiated, opts) catch |e| {
+            self.is_broken = true;
+            self.state = .broken;
+            return mapWriteErrQuery(e);
+        };
+        query_mod.writeEmptyDataTerminator(self.transport.writer(), negotiated) catch |e| {
+            self.is_broken = true;
+            self.state = .broken;
+            return mapWriteErrQuery(e);
+        };
+        self.transport.writer().flush() catch |e| {
+            self.is_broken = true;
+            self.state = .broken;
+            return mapWriteErrQuery(e);
+        };
+        emit(self.config, .query_sent);
+        self.last_used_at_ms = std.Io.Clock.now(.real, self.io).toMilliseconds();
+        // State stays .busy until the next commit's response-drain code
+        // walks the server's packets through to EndOfStream and resets
+        // it. For now callers should treat the Client as busy after this
+        // returns and not issue another sendQuery.
+    }
 };
 
 // --- private helpers -------------------------------------------------------
@@ -412,6 +471,15 @@ fn mapReadError(e: anyerror) ConnectError {
         error.StringTooLong,
         error.NestedExceptionsUnsupported,
         => error.ProtocolError,
+        else => error.ConnectionFailed,
+    };
+}
+
+fn mapWriteErrQuery(e: anyerror) QueryError {
+    return switch (e) {
+        error.WriteFailed => error.ConnectionFailed,
+        error.OutOfMemory => error.OutOfMemory,
+        error.Canceled, error.Cancelled => error.Cancelled,
         else => error.ConnectionFailed,
     };
 }
