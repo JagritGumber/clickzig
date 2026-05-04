@@ -1,16 +1,29 @@
 # clickzig
 
-A native-protocol ClickHouse client for Zig 0.16+, designed for low-latency analytical and quant workloads.
+A native-protocol ClickHouse client for Zig 0.16, designed for low-latency analytical and quant workloads.
 
-current version: **v0.16.1**
+**Status: in development.** Not yet released. The first tagged release will be `v0.16.0`, mirroring Zig 0.16.0, and will ship the complete client (handshake + query + insert + compression + connection pool) as a single coherent package — no incremental tags between now and then. Track `main` if you want to see progress.
 
 ## what it is
 
-clickzig speaks the ClickHouse native TCP protocol (port 9000) directly from Zig. The handshake, packet I/O, and lifecycle layers are in place; the query/insert path lands in v0.17. The architecture is locked for predictable allocation, swap-able I/O backends, and explicit cancellation, so a future connection pool wraps without API churn.
+clickzig speaks the ClickHouse native TCP protocol (port 9000) directly from Zig. Architecturally locked for predictable allocation, swap-able I/O backends, and explicit cancellation.
 
-## status
+## what works on `main` today
 
-v0.16.0 is the **handshake + ping + observability** release. You can connect, inspect server info, ping for liveness, observe lifecycle events, and plug in a custom transport. You **cannot** yet run queries or insert data — that's v0.17. If you need a working query path today, use one of the upstream-supported clients (clickhouse-go, clickhouse-cpp, clickhouse-rs).
+- Connect / handshake against ClickHouse 26.x (ServerHello parsing through revision 54_466 with full revision-gated reads)
+- Ping for liveness
+- Lifecycle observability via `Config.on_event`
+- Pluggable `Transport` (built-in `TcpTransport`, swap in your own)
+- Typed `ConnectError` with `Diagnostics` carrying parsed `ServerError`
+
+## what's still being built before v0.16.0 tags
+
+- Query / Data / Block parsing + iterator-shaped `Client.query`
+- Insert path with block-buffered builder
+- LZ4 + ZSTD compression
+- Connection pool
+- TLS (separate-port style on 9440)
+- DSN constructor
 
 ## design decisions worth knowing up front
 
@@ -23,26 +36,9 @@ v0.16.0 is the **handshake + ping + observability** release. You can connect, in
 
 ## install
 
-In your `build.zig.zon`:
+Not installable yet — no tagged release. Once `v0.16.0` ships, the install snippet will land here.
 
-```zig
-.dependencies = .{
-    .clickzig = .{
-        .url = "https://github.com/JagritGumber/clickzig/archive/refs/tags/v0.16.1.tar.gz",
-        // .hash will be filled in by `zig fetch`
-    },
-},
-```
-
-In your `build.zig`:
-
-```zig
-const clickzig = b.dependency("clickzig", .{
-    .target = target,
-    .optimize = optimize,
-});
-exe.root_module.addImport("clickzig", clickzig.module("clickzig"));
-```
+To preview from `main`, clone the repo and `@import("clickzig")` from a relative path or file URL.
 
 ## quick start
 
@@ -124,14 +120,7 @@ The smoke harness assumes `clickhouse/clickhouse-server:26.3` running locally wi
 
 ### release pipeline
 
-Pushing a `v*` tag triggers `.github/workflows/release.yml`, which gates on the test + examples suites at the tagged commit and creates a GitHub Release with auto-generated notes (commit log since the previous tag) and an install snippet. Pre-release tags (`v*-alpha`, `v*-beta`, `v*-rc`) are flagged as pre-release on the Releases page.
-
-Tags are immutable once published — to fix a release, bump to the next patch version (`v0.16.1`) rather than retagging.
-
-## roadmap
-
-- **v0.17**: query/insert path, Block decoder, LZ4/ZSTD compression, connection pool, TLS, DSN constructor.
-- **v0.18+**: multi-host failover, async via `std.Io` fibers.
+`.github/workflows/release.yml` is wired to fire on `v*` tag pushes. It gates on `zig build test` + `zig build examples` at the tagged commit, then creates a GitHub Release with auto-generated notes. Will fire once on `v0.16.0` when the package is feature-complete.
 
 ## license
 
