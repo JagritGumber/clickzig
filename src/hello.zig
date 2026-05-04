@@ -74,14 +74,19 @@ pub const HelloResult = union(enum) {
 };
 
 /// Emit the client Hello packet. Bytes match upstream Connection::sendHello.
+/// `client_name` identifies the application in the server's `system.query_log`
+/// and `system.processes` views — pass null to use the default
+/// `protocol.ClientName`. Quant shops correlating prod traffic by tenant
+/// should always set this.
 pub fn writeClientHello(
     writer: *std.Io.Writer,
     database: []const u8,
     username: []const u8,
     password: []const u8,
+    client_name: ?[]const u8,
 ) std.Io.Writer.Error!void {
     try wire.writeClientPacketId(writer, .Hello);
-    try wire.writeStringBinary(writer, protocol.ClientName);
+    try wire.writeStringBinary(writer, client_name orelse protocol.ClientName);
     try varint.writeVarUInt(writer, protocol.ClientVersionMajor);
     try varint.writeVarUInt(writer, protocol.ClientVersionMinor);
     try varint.writeVarUInt(writer, protocol.CLIENT_REVISION);
@@ -186,18 +191,24 @@ pub fn readHelloResult(
         nonce = try reader.takeInt(u64, .little);
     }
 
-    // 54_474: server settings (name, flags, value) tuples. Read+discard.
+    // 54_474: server settings, sentinel-terminated (NOT count-prefixed).
+    // Format: { string(name), varint(flags), string(value) }* string("")
+    // Mirrors upstream BaseSettings::read in src/Core/BaseSettings.h.
+    // Iteration is bounded by SETTINGS_COUNT_MAX so a hostile peer can't
+    // loop forever by never sending the empty-name sentinel.
     if (server_rev >= protocol.Revision.WITH_SERVER_SETTINGS) {
-        const count = try varint.readVarUInt(reader, u64);
-        if (count > SETTINGS_COUNT_MAX) return error.UnexpectedPacket;
-        var i: u64 = 0;
-        while (i < count) : (i += 1) {
+        var iters: u64 = 0;
+        while (iters < SETTINGS_COUNT_MAX) : (iters += 1) {
             const setting_name = try wire.readStringOwned(reader, allocator, HELLO_STRING_MAX);
+            if (setting_name.len == 0) {
+                allocator.free(setting_name);
+                break;
+            }
             allocator.free(setting_name);
-            _ = try varint.readVarUInt(reader, u64);
+            _ = try varint.readVarUInt(reader, u64); // flags
             const setting_val = try wire.readStringOwned(reader, allocator, HELLO_STRING_MAX);
             allocator.free(setting_val);
-        }
+        } else return error.UnexpectedPacket;
     }
 
     // 54_477: query plan serialization version. Read+discard.
@@ -233,7 +244,7 @@ const testing = std.testing;
 test "writeClientHello byte shape" {
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try writeClientHello(&w, "default", "default", "");
+    try writeClientHello(&w, "default", "default", "", null);
     const written = w.buffered();
 
     // First byte: packet id Hello = 0
@@ -257,6 +268,17 @@ test "writeClientHello byte shape" {
     try testing.expectEqual(@as(u8, 7), written[34]); // user len
     try testing.expectEqualStrings("default", written[35..42]);
     try testing.expectEqual(@as(u8, 0), written[42]); // password len = 0
+}
+
+test "writeClientHello uses client_name override when provided" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeClientHello(&w, "default", "u", "p", "trading-engine/v3");
+    const written = w.buffered();
+    // packet id (1 byte) + name length-prefix (1 byte) + name (17 bytes)
+    try testing.expectEqual(@as(u8, 0), written[0]);
+    try testing.expectEqual(@as(u8, 17), written[1]);
+    try testing.expectEqualStrings("trading-engine/v3", written[2..19]);
 }
 
 test "readHelloResult parses ServerHello at pinned client revision" {

@@ -18,6 +18,19 @@
 //! `*Client` allocated from `config.control_allocator`. Caller pattern:
 //!   const client = try Client.connectTcp(cfg, io, null, null);
 //!   defer client.close();   // single-call; frees the Client struct
+//!
+//! THREAD-SAFETY: a single `Client` is NOT thread-safe. State machine
+//! writes (`state`, `is_broken`, `last_used_at_ms`) are non-atomic.
+//! The protocol contract is "one connection serves one in-flight
+//! operation at a time" — concurrent calls from multiple threads on
+//! the same `Client` are undefined behaviour. For multi-threaded
+//! workloads, use one `Client` per thread (a connection pool wrapping
+//! per-thread Clients lands in v0.17).
+//!
+//! Cancellation note: `*const std.atomic.Value(bool)` is the right
+//! primitive for our sync API. Zig 0.16's `Future.cancel` is tied to
+//! async task cancellation and would require restructuring every public
+//! method around `io.async`. The atomic-bool stays.
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
@@ -56,14 +69,37 @@ pub const Diagnostics = struct {
 };
 
 pub const ConnectError = error{
+    /// Generic catch-all transport failure. Prefer the more specific
+    /// variants below when the cause is known; this remains for the
+    /// "we couldn't connect, ask the OS why" case.
     ConnectionFailed,
+    /// TCP connection refused by the peer (port not listening, or the
+    /// server-side ACL rejected the SYN).
+    ConnectionRefused,
+    /// No route to the target IP (network down, gateway missing, etc.).
+    HostUnreachable,
+    /// DNS lookup of `Config.host` did not resolve to any address.
+    DnsFailure,
+    /// Wire-protocol violation: malformed varint, unexpected packet ID,
+    /// length cap exceeded, etc.
     ProtocolError,
+    /// Server rejected our credentials (wrong password, unknown user).
     AuthenticationFailed,
+    /// Server returned an Exception during handshake that wasn't an
+    /// auth failure. Inspect `Diagnostics.server_exception` for detail.
     ServerExceptionDuringHello,
+    /// Negotiated revision too old for this client (unused at v0.16,
+    /// reserved for the v0.17 query path).
     UnsupportedServerRevision,
+    /// TCP `connect` did not complete before `dial_timeout_ms`.
     ConnectTimeout,
+    /// Read on an established socket exceeded `read_timeout_ms`. Not
+    /// yet enforced at the OS level — tracked for v0.17 per-op timeouts.
     ReadTimeout,
+    /// Write on an established socket exceeded `write_timeout_ms`. Same
+    /// caveat as `ReadTimeout`.
     WriteTimeout,
+    /// Caller-provided cancellation token observed `true`.
     Cancelled,
     OutOfMemory,
 };
@@ -74,6 +110,13 @@ pub const Config = struct {
     username: []const u8 = "default",
     password: []const u8 = "",
     database: []const u8 = "default",
+
+    /// Application identifier sent in the Hello packet. Surfaces in the
+    /// server's `system.query_log.client_name` and `system.processes`
+    /// views, which is how multi-tenant operators correlate workload by
+    /// service. Pass null to use the library default
+    /// (`"ClickHouse clickzig"`). Must outlive the Client.
+    client_name: ?[]const u8 = null,
 
     /// Long-lived allocator for Client + ServerInfo + ServerError.
     /// MUST outlive the Client. Cannot be enforced at compile time.
@@ -179,7 +222,7 @@ pub const Client = struct {
 
         // --- Hello write + flush ---
         emit(config, .hello_sent);
-        hello.writeClientHello(transport.writer(), config.database, config.username, config.password) catch |e| {
+        hello.writeClientHello(transport.writer(), config.database, config.username, config.password, config.client_name) catch |e| {
             client.is_broken = true;
             client.state = .broken;
             return mapWriteError(e);
@@ -376,9 +419,11 @@ fn mapReadError(e: anyerror) ConnectError {
 fn mapTcpConnectError(e: transport_mod.ConnectError) ConnectError {
     return switch (e) {
         error.ConnectionTimeout => error.ConnectTimeout,
+        error.ConnectionRefused => error.ConnectionRefused,
+        error.NetworkUnreachable => error.HostUnreachable,
+        error.HostResolutionFailed, error.InvalidHost => error.DnsFailure,
         error.OutOfMemory => error.OutOfMemory,
         error.Canceled => error.Cancelled,
-        else => error.ConnectionFailed,
     };
 }
 

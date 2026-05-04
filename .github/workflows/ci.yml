@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: zig build test
+        run: zig build test --summary all
+      - name: zig build examples (compile-only)
+        run: zig build examples --summary all
+
+  smoke:
+    name: Smoke against real ClickHouse
+    runs-on: ubuntu-latest
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.3
+        ports:
+          - 9000:9000
+          - 8123:8123
+        env:
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+          CLICKHOUSE_PASSWORD: test
+        options: >-
+          --health-cmd "wget --quiet --tries=1 --spider http://localhost:8123/ping || exit 1"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Wait for ClickHouse
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf -u default:test "http://localhost:8123/?query=SELECT+1" > /dev/null; then
+              echo "ClickHouse is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "ClickHouse failed to start"
+          exit 1
+      - name: smoke happy
+        run: zig build smoke -- happy
+      - name: smoke ping
+        run: zig build smoke -- ping
+      - name: smoke wrong-pass
+        run: zig build smoke -- wrong-pass
+      - name: smoke unreachable
+        run: zig build smoke -- unreachable
+      - name: smoke wrong-host
+        run: zig build smoke -- wrong-host

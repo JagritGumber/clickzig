@@ -46,7 +46,7 @@ pub const TcpOptions = transport_mod.TcpOptions;
 /// per-query overrides land in v0.17 with the Query packet.
 pub const SettingsMap = std.StringHashMapUnmanaged([]const u8);
 
-pub const VERSION = "0.16.0-alpha.1";
+pub const VERSION = "0.16.0";
 
 test {
     std.testing.refAllDecls(@This());
