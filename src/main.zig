@@ -35,6 +35,9 @@ pub const Pool = pool.Pool;
 pub const PoolOptions = pool.Options;
 pub const dsn = @import("dsn.zig");
 pub const fromUri = dsn.fromUri;
+pub const tls_transport = @import("tls_transport.zig");
+pub const TlsTransport = tls_transport.TlsTransport;
+pub const TlsOptions = tls_transport.Options;
 
 pub const ClientError = cherror.ClientError;
 pub const ServerError = cherror.ServerError;

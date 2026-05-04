@@ -13,8 +13,8 @@ const varint = @import("varint.zig");
 
 /// Identifies a primitive (non-wrapped) column type.
 pub const TypeId = enum {
-    UInt8, UInt16, UInt32, UInt64,
-    Int8, Int16, Int32, Int64,
+    UInt8, UInt16, UInt32, UInt64, UInt128,
+    Int8, Int16, Int32, Int64, Int128,
     Float32, Float64,
     String,
 };
@@ -24,10 +24,12 @@ pub const Column = union(enum) {
     UInt16: []u16,
     UInt32: []u32,
     UInt64: []u64,
+    UInt128: []u128,
     Int8: []i8,
     Int16: []i16,
     Int32: []i32,
     Int64: []i64,
+    Int128: []i128,
     Float32: []f32,
     Float64: []f64,
     String: [][]u8,
@@ -113,12 +115,14 @@ pub fn typeIdFromName(type_name: []const u8) ?TypeId {
     const startsWith = std.mem.startsWith;
     if (eq(u8, type_name, "UInt8") or eq(u8, type_name, "Bool")) return .UInt8;
     if (eq(u8, type_name, "UInt16")) return .UInt16;
-    if (eq(u8, type_name, "UInt32")) return .UInt32;
+    if (eq(u8, type_name, "UInt32") or eq(u8, type_name, "IPv4")) return .UInt32;
     if (eq(u8, type_name, "UInt64")) return .UInt64;
+    if (eq(u8, type_name, "UInt128")) return .UInt128;
     if (eq(u8, type_name, "Int8") or startsWith(u8, type_name, "Enum8")) return .Int8;
     if (eq(u8, type_name, "Int16") or startsWith(u8, type_name, "Enum16")) return .Int16;
     if (eq(u8, type_name, "Int32") or eq(u8, type_name, "Date32")) return .Int32;
     if (eq(u8, type_name, "Int64")) return .Int64;
+    if (eq(u8, type_name, "Int128")) return .Int128;
     if (eq(u8, type_name, "Float32")) return .Float32;
     if (eq(u8, type_name, "Float64")) return .Float64;
     if (eq(u8, type_name, "String")) return .String;
@@ -127,6 +131,26 @@ pub fn typeIdFromName(type_name: []const u8) ?TypeId {
     // DateTime(...) is u32 seconds-since-epoch.
     if (startsWith(u8, type_name, "DateTime64")) return .UInt64;
     if (startsWith(u8, type_name, "DateTime")) return .UInt32;
+    // Decimal aliases: scaled int. Caller multiplies by 10^scale to
+    // recover the rational value. Decimal128/256(S) → underlying int.
+    if (startsWith(u8, type_name, "Decimal32")) return .Int32;
+    if (startsWith(u8, type_name, "Decimal64")) return .Int64;
+    if (startsWith(u8, type_name, "Decimal128")) return .Int128;
+    if (startsWith(u8, type_name, "Decimal(")) {
+        // Decimal(P, S): underlying int width determined by P.
+        //   P <=  9 → Int32   (Decimal32)
+        //   P <= 18 → Int64   (Decimal64)
+        //   P <= 38 → Int128  (Decimal128)
+        //   P <= 76 → Int256  (not yet supported; returns null)
+        const inside = type_name[8..type_name.len - 1];
+        const comma = std.mem.indexOfScalar(u8, inside, ',') orelse return null;
+        const p_str = std.mem.trim(u8, inside[0..comma], " ");
+        const p = std.fmt.parseInt(u8, p_str, 10) catch return null;
+        if (p <= 9) return .Int32;
+        if (p <= 18) return .Int64;
+        if (p <= 38) return .Int128;
+        return null;
+    }
     return null;
 }
 
@@ -177,6 +201,14 @@ pub fn readColumn(
         try reader.readSliceAll(std.mem.sliceAsBytes(rows));
         return .{ .UUID = rows };
     }
+    // IPv6 is canonically a 16-byte fixed-width column on the wire.
+    if (std.mem.eql(u8, type_name, "IPv6")) {
+        const total = @as(usize, @intCast(num_rows)) * 16;
+        const data = try allocator.alloc(u8, total);
+        errdefer allocator.free(data);
+        try reader.readSliceAll(data);
+        return .{ .FixedString = .{ .width = 16, .data = data } };
+    }
     const tid = typeIdFromName(type_name) orelse return error.UnsupportedColumnType;
     const n: usize = @intCast(num_rows);
     return switch (tid) {
@@ -184,10 +216,12 @@ pub fn readColumn(
         .UInt16 => .{ .UInt16 = try readFixed(u16, reader, allocator, n) },
         .UInt32 => .{ .UInt32 = try readFixed(u32, reader, allocator, n) },
         .UInt64 => .{ .UInt64 = try readFixed(u64, reader, allocator, n) },
+        .UInt128 => .{ .UInt128 = try readFixed(u128, reader, allocator, n) },
         .Int8 => .{ .Int8 = try readFixed(i8, reader, allocator, n) },
         .Int16 => .{ .Int16 = try readFixed(i16, reader, allocator, n) },
         .Int32 => .{ .Int32 = try readFixed(i32, reader, allocator, n) },
         .Int64 => .{ .Int64 = try readFixed(i64, reader, allocator, n) },
+        .Int128 => .{ .Int128 = try readFixed(i128, reader, allocator, n) },
         .Float32 => .{ .Float32 = try readFixed(f32, reader, allocator, n) },
         .Float64 => .{ .Float64 = try readFixed(f64, reader, allocator, n) },
         .String => blk: {

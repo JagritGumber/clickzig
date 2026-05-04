@@ -77,3 +77,5 @@ jobs:
         run: zig build smoke -- pool
       - name: smoke dsn
         run: zig build smoke -- dsn
+      - name: smoke decimal-ip
+        run: zig build smoke -- decimal-ip

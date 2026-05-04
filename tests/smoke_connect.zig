@@ -45,10 +45,43 @@ pub fn main(init: std.process.Init) !void {
         try runPool(allocator, io);
     } else if (std.mem.eql(u8, scenario, "dsn")) {
         try runDsn(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "decimal-ip")) {
+        try runDecimalIp(allocator, io);
     } else {
         std.debug.print("usage: smoke_connect [happy|ping|wrong-pass|unreachable|wrong-host|query-bytes]\n", .{});
         return error.UnknownScenario;
     }
+}
+
+fn runDecimalIp(allocator: std.mem.Allocator, io: std.Io) !void {
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    defer client.close();
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    var s = try client.query(
+        \\SELECT
+        \\    toDecimal64(123.45, 2) AS price,
+        \\    toIPv4('192.168.1.1') AS v4,
+        \\    toIPv6('2001:db8::1') AS v6,
+        \\    toUInt128(toUInt64(0xFFFF) * toUInt64(0x10001)) AS big
+    , arena.allocator(), null, .{});
+    while (try s.next()) |p| switch (p) {
+        .data => |b| {
+            if (b.num_rows == 0) continue;
+            // Decimal64(2): scaled int64; 12345 / 100 = 123.45
+            const price_raw = b.columns[0].column.Int64[0];
+            const v4 = b.columns[1].column.UInt32[0];
+            const v6_bytes = b.columns[2].column.FixedString.data[0..16];
+            const big = b.columns[3].column.UInt128[0];
+            std.debug.print("[decimal-ip] price_raw={d} (= {d}.{d:0>2})\n", .{ price_raw, @divTrunc(price_raw, 100), @rem(price_raw, 100) });
+            std.debug.print("[decimal-ip] v4=0x{X:0>8} v6_first={X:0>2}{X:0>2} big={X}\n", .{ v4, v6_bytes[0], v6_bytes[1], big });
+            if (price_raw != 12345) return error.DecimalMismatch;
+        },
+        .end_of_stream => break,
+        .exception => |e| { std.debug.print("[decimal-ip] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        else => {},
+    };
+    std.debug.print("[decimal-ip] OK\n", .{});
 }
 
 fn runDsn(allocator: std.mem.Allocator, io: std.Io) !void {
