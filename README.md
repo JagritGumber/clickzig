@@ -122,6 +122,12 @@ zig build smoke -- wrong-host
 
 The smoke harness assumes `clickhouse/clickhouse-server:26.3` running locally with `default:test` credentials. CI runs all five against a service container on every push.
 
+### release pipeline
+
+Pushing a `v*` tag triggers `.github/workflows/release.yml`, which gates on the test + examples suites at the tagged commit and creates a GitHub Release with auto-generated notes (commit log since the previous tag) and an install snippet. Pre-release tags (`v*-alpha`, `v*-beta`, `v*-rc`) are flagged as pre-release on the Releases page.
+
+Tags are immutable once published — to fix a release, bump to the next patch version (`v0.16.1`) rather than retagging.
+
 ## roadmap
 
 - **v0.17**: query/insert path, Block decoder, LZ4/ZSTD compression, connection pool, TLS, DSN constructor.
