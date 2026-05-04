@@ -77,10 +77,9 @@ pub const Packet = union(enum) {
     end_of_stream,
 
     pub fn deinit(self: Packet, allocator: std.mem.Allocator) void {
-        _ = allocator;
         switch (self) {
             .data, .profile_events, .log, .totals, .extremes => |b| b.deinit(),
-            .table_columns => |t| t.deinit(t.table_name.ptr[0..0].len + std.heap.page_allocator),
+            .table_columns => |t| t.deinit(allocator),
             .exception => |e| e.deinit(),
             else => {},
         }
@@ -121,12 +120,21 @@ pub const ResultStream = struct {
             self.markBroken();
             return e;
         };
+        // Per upstream Connection::receivePacket: Data / Totals / Extremes
+        // ride through `maybe_compressed_in` (compressed when compression
+        // is on), but Log and ProfileEvents are always read via raw `*in`
+        // (initBlockLogsInput / initBlockProfileEventsInput both wrap
+        // the raw stream, never the compressed one). The asymmetry is
+        // load-bearing — without it, an LZ4-on session hangs on the
+        // first ProfileEvents packet because we look for a frame header
+        // where there isn't one.
+        const compressed_body = self.compression == .Enable;
         switch (packet_id) {
-            .Data => return .{ .data = try self.readBlockAndCheck() },
-            .Totals => return .{ .totals = try self.readBlockAndCheck() },
-            .Extremes => return .{ .extremes = try self.readBlockAndCheck() },
-            .Log => return .{ .log = try self.readBlockAndCheck() },
-            .ProfileEvents => return .{ .profile_events = try self.readBlockAndCheck() },
+            .Data => return .{ .data = try self.readBlockAndCheck(compressed_body) },
+            .Totals => return .{ .totals = try self.readBlockAndCheck(compressed_body) },
+            .Extremes => return .{ .extremes = try self.readBlockAndCheck(compressed_body) },
+            .Log => return .{ .log = try self.readBlockAndCheck(false) },
+            .ProfileEvents => return .{ .profile_events = try self.readBlockAndCheck(false) },
             .Progress => return .{ .progress = try self.readProgress() },
             .ProfileInfo => return .{ .profile_info = try self.readProfileInfo() },
             .TableColumns => return .{ .table_columns = try self.readTableColumns() },
@@ -149,18 +157,42 @@ pub const ResultStream = struct {
         }
     }
 
-    fn readBlockAndCheck(self: *ResultStream) !block_mod.Block {
-        if (self.compression == .Enable) {
+    fn readBlockAndCheck(self: *ResultStream, compressed_body: bool) !block_mod.Block {
+        if (compressed_body) {
+            // Symmetrical to the write side: `table_name` rides UNCOMPRESSED
+            // before the frame on the wire (matches upstream Connection::sendData
+            // which writes `name` to the raw stream and only the block body
+            // through `maybe_compressed_out`). Read it from the outer reader
+            // first, then read the frame, then parse the body from the
+            // decompressed bytes — passing `table_name` in so `readBlockBody`
+            // takes ownership.
+            const table_name = wire.readStringOwned(self.reader, self.allocator, wire.MAX_DEFAULT_STRING) catch |e| {
+                self.markBroken();
+                return e;
+            };
+            // Past this point ownership of `table_name` belongs to readBlockBody
+            // (which has its own errdefer on it). Don't add another guard here.
             const frame = compression_mod.readFrame(self.reader, self.allocator) catch |e| {
+                self.allocator.free(table_name);
                 self.markBroken();
                 return e;
             };
             defer self.allocator.free(frame);
             var fr: std.Io.Reader = .fixed(frame);
-            return block_mod.readBlock(&fr, self.allocator, self.server_revision) catch |e| {
+            const block = block_mod.readBlockBody(&fr, self.allocator, self.server_revision, table_name) catch |e| {
                 self.markBroken();
                 return e;
             };
+            // Frame must be consumed exactly — leftover bytes signal a
+            // row-data-sizing bug inside the column decoder, not a framing
+            // bug. Surface it loudly rather than silently misalign the next
+            // packet's read.
+            if (fr.buffered().len != 0) {
+                block.deinit();
+                self.markBroken();
+                return error.UnexpectedPacket;
+            }
+            return block;
         }
         return block_mod.readBlock(self.reader, self.allocator, self.server_revision) catch |e| {
             self.markBroken();
@@ -296,4 +328,126 @@ test "ResultStream routes Exception terminator" {
     defer p.exception.deinit();
     try testing.expectEqual(@as(u32, 60), p.exception.code);
     try testing.expectEqual(@as(?Packet, null), try stream.next());
+}
+
+test "ResultStream with compression on reads table_name BEFORE the frame" {
+    // Regression lock: when compression is enabled, the Data packet's
+    // table_name rides UNCOMPRESSED before the LZ4 frame on the wire
+    // (mirroring upstream Connection::sendData where `name` goes to raw
+    // out and only the block body goes through maybe_compressed_out).
+    // If readBlockAndCheck regresses to consuming table_name from inside
+    // the decompressed bytes, this test fails — and the compression smoke
+    // hangs the server for 5 minutes because compressed_size becomes a
+    // garbage u32 read from random offsets.
+    const ally = testing.allocator;
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+
+    // Server packet shape: packet_id Data + table_name "" + frame{ body }
+    try varint.writeVarUInt(&w, @intFromEnum(protocol.ServerPacket.Data));
+    try wire.writeStringBinary(&w, ""); // uncompressed table_name
+    // Build the body that goes inside the frame: BlockInfo + 0 cols + 0 rows.
+    var body_buf: [32]u8 = undefined;
+    var bw: std.Io.Writer = .fixed(&body_buf);
+    try varint.writeVarUInt(&bw, 1);
+    try bw.writeByte(0);
+    try varint.writeVarUInt(&bw, 2);
+    try bw.writeInt(i32, -1, .little);
+    try varint.writeVarUInt(&bw, 0);
+    try varint.writeVarUInt(&bw, 0);
+    try varint.writeVarUInt(&bw, 0);
+    try compression_mod.writeFrameLz4(&w, ally, bw.buffered());
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var stream: ResultStream = .{
+        .reader = &r,
+        .allocator = ally,
+        .server_revision = protocol.CLIENT_REVISION,
+        .compression = .Enable,
+    };
+    const p = (try stream.next()).?;
+    try testing.expect(p == .data);
+    defer p.data.deinit();
+    try testing.expectEqualStrings("", p.data.table_name);
+    try testing.expectEqual(@as(u64, 0), p.data.num_rows);
+    try testing.expectEqual(@as(usize, 0), p.data.columns.len);
+}
+
+test "ResultStream compressed Data round-trips a 1-col 1-row block + asserts exact frame consumption" {
+    // Locks the `fr.buffered().len == 0` invariant: the frame must be
+    // consumed exactly by readBlockBody. A column-decoder sizing bug
+    // (e.g. reading too few bytes for a UInt8 column) would leave
+    // residue and surface as ProtocolError rather than silently
+    // misalign the next packet's read.
+    const ally = testing.allocator;
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+
+    try varint.writeVarUInt(&w, @intFromEnum(protocol.ServerPacket.Data));
+    try wire.writeStringBinary(&w, "");
+    var body_buf: [64]u8 = undefined;
+    var bw: std.Io.Writer = .fixed(&body_buf);
+    // BlockInfo
+    try varint.writeVarUInt(&bw, 1);
+    try bw.writeByte(0);
+    try varint.writeVarUInt(&bw, 2);
+    try bw.writeInt(i32, -1, .little);
+    try varint.writeVarUInt(&bw, 0);
+    // 1 col, 1 row
+    try varint.writeVarUInt(&bw, 1);
+    try varint.writeVarUInt(&bw, 1);
+    try wire.writeStringBinary(&bw, "x");
+    try wire.writeStringBinary(&bw, "UInt8");
+    try bw.writeByte(0); // has_custom_serialization = 0
+    try bw.writeByte(42); // value
+    try compression_mod.writeFrameLz4(&w, ally, bw.buffered());
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var stream: ResultStream = .{
+        .reader = &r,
+        .allocator = ally,
+        .server_revision = protocol.CLIENT_REVISION,
+        .compression = .Enable,
+    };
+    const p = (try stream.next()).?;
+    try testing.expect(p == .data);
+    defer p.data.deinit();
+    try testing.expectEqual(@as(u64, 1), p.data.num_rows);
+    try testing.expectEqual(@as(usize, 1), p.data.columns.len);
+    try testing.expectEqual(@as(u8, 42), p.data.columns[0].column.UInt8[0]);
+}
+
+test "ResultStream with compression on reads ProfileEvents UNCOMPRESSED" {
+    // Regression lock: even when self.compression == .Enable, ProfileEvents
+    // (and Log) are sent without a compression frame. Upstream
+    // initBlockProfileEventsInput / initBlockLogsInput wrap the raw
+    // stream, never maybe_compressed_in. Treating the body as compressed
+    // hangs the connection on the first Profile/Log packet because
+    // we look for a frame header where there isn't one.
+    const ally = testing.allocator;
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+
+    try varint.writeVarUInt(&w, @intFromEnum(protocol.ServerPacket.ProfileEvents));
+    // Uncompressed block body: table_name "" + BlockInfo + 0 cols + 0 rows
+    try wire.writeStringBinary(&w, "");
+    try varint.writeVarUInt(&w, 1);
+    try w.writeByte(0);
+    try varint.writeVarUInt(&w, 2);
+    try w.writeInt(i32, -1, .little);
+    try varint.writeVarUInt(&w, 0);
+    try varint.writeVarUInt(&w, 0);
+    try varint.writeVarUInt(&w, 0);
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var stream: ResultStream = .{
+        .reader = &r,
+        .allocator = ally,
+        .server_revision = protocol.CLIENT_REVISION,
+        .compression = .Enable,
+    };
+    const p = (try stream.next()).?;
+    try testing.expect(p == .profile_events);
+    defer p.profile_events.deinit();
+    try testing.expect(p.profile_events.isEmpty());
 }

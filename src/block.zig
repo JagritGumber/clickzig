@@ -125,6 +125,21 @@ pub fn readBlock(
     server_revision: u64,
 ) !Block {
     const table_name = try wire.readStringOwned(reader, allocator, wire.MAX_DEFAULT_STRING);
+    return readBlockBody(reader, allocator, server_revision, table_name);
+}
+
+/// Parse the post-`table_name` portion of a Block from `reader` (BlockInfo
+/// + counts + columns). Caller passes an already-owned `table_name`;
+/// ownership transfers in here. The compression read path uses this so
+/// it can pull `table_name` from the OUTER (uncompressed) reader before
+/// reading the compression frame, then feed only the decompressed body
+/// to this function.
+pub fn readBlockBody(
+    reader: *std.Io.Reader,
+    allocator: std.mem.Allocator,
+    server_revision: u64,
+    table_name: []const u8,
+) !Block {
     errdefer allocator.free(table_name);
 
     var info: BlockInfo = .{};
