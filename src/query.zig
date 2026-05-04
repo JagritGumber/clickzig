@@ -76,29 +76,44 @@ pub fn writeClientQuery(
     }
 }
 
-/// Write the empty Data block that terminates a Query (signals "no
-/// external/INSERT data follows; server, please respond"). Block layout:
-///   varint(ClientPacket.Data)
-///   string(table_name = "")
-///   BlockInfo: varint(field 1=is_overflows) u8(0) varint(field 2=bucket_num) i32(-1) varint(0=end)
-///   varint(0 columns)
-///   varint(0 rows)
+/// Write the empty Data block that terminates a Query. When compression
+/// is on, only the block BODY (BlockInfo + counts) is wrapped in a
+/// frame; the packet_id + table_name stay uncompressed since they're
+/// the Data packet header, not part of the Block.
 pub fn writeEmptyDataTerminator(
     writer: *std.Io.Writer,
     server_revision: u64,
 ) std.Io.Writer.Error!void {
+    try writeDataPacketHeader(writer, "");
+    try writeEmptyBlockBody(writer, server_revision);
+}
+
+/// Data packet header: packet_id + table_name. Always uncompressed.
+pub fn writeDataPacketHeader(
+    writer: *std.Io.Writer,
+    table_name: []const u8,
+) std.Io.Writer.Error!void {
     try wire.writeClientPacketId(writer, .Data);
-    try wire.writeStringBinary(writer, ""); // table_name
+    try wire.writeStringBinary(writer, table_name);
+}
+
+/// Empty Block body (BlockInfo + 0 columns + 0 rows). When compression
+/// is enabled the caller serializes this into a buffer first, then
+/// wraps via compression.writeFrameLz4.
+pub fn writeEmptyBlockBody(
+    writer: *std.Io.Writer,
+    server_revision: u64,
+) std.Io.Writer.Error!void {
     if (server_revision >= protocol.Revision.WITH_BLOCK_INFO) {
         // BlockInfo: field 1 (is_overflows = false), field 2 (bucket_num = -1), then field 0 (end).
         try varint.writeVarUInt(writer, 1);
-        try writer.writeByte(0); // is_overflows = false
+        try writer.writeByte(0);
         try varint.writeVarUInt(writer, 2);
-        try writer.writeInt(i32, -1, .little); // bucket_num
-        try varint.writeVarUInt(writer, 0); // end of fields
+        try writer.writeInt(i32, -1, .little);
+        try varint.writeVarUInt(writer, 0);
     }
-    try varint.writeVarUInt(writer, 0); // num_columns
-    try varint.writeVarUInt(writer, 0); // num_rows
+    try varint.writeVarUInt(writer, 0);
+    try varint.writeVarUInt(writer, 0);
 }
 
 const testing = std.testing;

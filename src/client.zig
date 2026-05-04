@@ -43,6 +43,7 @@ const query_mod = @import("query.zig");
 const client_info_mod = @import("client_info.zig");
 const result_stream_mod = @import("result_stream.zig");
 const block_mod = @import("block.zig");
+const compression_mod = @import("compression.zig");
 
 pub const ServerInfo = hello.ServerInfo;
 
@@ -154,6 +155,14 @@ pub const Config = struct {
     proto_send_chunked: []const u8 = "notchunked_optional",
     proto_recv_chunked: []const u8 = "notchunked_optional",
 
+    /// Compression negotiation. Default is Disable; setting Enable
+    /// advertises LZ4 as the only supported codec (ZSTD encoder isn't
+    /// in 0.16's stdlib, so we negotiate LZ4 even though decompress
+    /// supports both). When enabled, every Data block sent or received
+    /// is wrapped in a compression frame (16-byte CityHash128 +
+    /// method + sizes + payload).
+    compression: protocol.CompressionEnabled = .Disable,
+
     /// Observability hook. See decision #11+#15 for the contract:
     /// callback must NOT panic, allocate from control_allocator,
     /// reenter Client methods, or block. Library does not catch
@@ -172,6 +181,9 @@ pub const Client = struct {
     is_broken: bool,
     connected_at_ms: i64,
     last_used_at_ms: i64,
+    /// Per-query default compression mode, copied from config at
+    /// connect time. Per-call override on sendQuery/insert is allowed.
+    compression: protocol.CompressionEnabled = .Disable,
 
     /// Connect over TCP using the built-in TcpTransport.
     pub fn connectTcp(
@@ -225,6 +237,7 @@ pub const Client = struct {
             .is_broken = false,
             .connected_at_ms = now_ms,
             .last_used_at_ms = now_ms,
+            .compression = config.compression,
         };
 
         if (cancellationRequested(cancel)) {
@@ -402,11 +415,15 @@ pub const Client = struct {
         self: *Client,
         query_text: []const u8,
         cancel: ?*const std.atomic.Value(bool),
-        opts: query_mod.QueryOptions,
+        opts_in: query_mod.QueryOptions,
     ) QueryError!void {
         if (self.state != .ready) return error.ClientNotReady;
         if (cancellationRequested(cancel)) return error.Cancelled;
         self.state = .busy;
+
+        // If caller didn't override, fall back to the client-wide setting.
+        var opts = opts_in;
+        if (opts.compression == .Disable and self.compression == .Enable) opts.compression = .Enable;
 
         const negotiated = self.server_info.negotiated(protocol.CLIENT_REVISION);
         const info: client_info_mod.ClientInfo = .{
@@ -419,11 +436,37 @@ pub const Client = struct {
             self.state = .broken;
             return mapWriteErrQuery(e);
         };
-        query_mod.writeEmptyDataTerminator(self.transport.writer(), negotiated) catch |e| {
+        // Empty Data terminator. When compression is on, wrap the
+        // BLOCK BODY (everything after the packet_id + table_name) in
+        // an LZ4 frame; the packet header itself stays uncompressed.
+        query_mod.writeDataPacketHeader(self.transport.writer(), "") catch |e| {
             self.is_broken = true;
             self.state = .broken;
             return mapWriteErrQuery(e);
         };
+        if (opts.compression == .Enable) {
+            // Buffer the body, wrap in compression frame.
+            var body_alloc: std.heap.ArenaAllocator = .init(self.config.control_allocator);
+            defer body_alloc.deinit();
+            var body_buf: std.Io.Writer.Allocating = .init(body_alloc.allocator());
+            defer body_buf.deinit();
+            query_mod.writeEmptyBlockBody(&body_buf.writer, negotiated) catch |e| {
+                self.is_broken = true;
+                self.state = .broken;
+                return mapWriteErrQuery(e);
+            };
+            compression_mod.writeFrameLz4(self.transport.writer(), body_alloc.allocator(), body_buf.written()) catch |e| {
+                self.is_broken = true;
+                self.state = .broken;
+                return mapWriteErrQuery(e);
+            };
+        } else {
+            query_mod.writeEmptyBlockBody(self.transport.writer(), negotiated) catch |e| {
+                self.is_broken = true;
+                self.state = .broken;
+                return mapWriteErrQuery(e);
+            };
+        }
         self.transport.writer().flush() catch |e| {
             self.is_broken = true;
             self.state = .broken;
@@ -445,11 +488,13 @@ pub const Client = struct {
         cancel: ?*const std.atomic.Value(bool),
         opts: query_mod.QueryOptions,
     ) QueryError!result_stream_mod.ResultStream {
+        const effective_compression: protocol.CompressionEnabled = if (opts.compression == .Enable or self.compression == .Enable) .Enable else .Disable;
         try self.sendQuery(query_text, cancel, opts);
         return .{
             .reader = self.transport.reader(),
             .allocator = query_allocator,
             .server_revision = self.server_info.negotiated(protocol.CLIENT_REVISION),
+            .compression = effective_compression,
             .client_state = .{
                 .state = self,
                 .is_broken = &self.is_broken,

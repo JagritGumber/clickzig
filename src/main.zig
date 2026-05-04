@@ -38,6 +38,9 @@ pub const fromUri = dsn.fromUri;
 pub const tls_transport = @import("tls_transport.zig");
 pub const TlsTransport = tls_transport.TlsTransport;
 pub const TlsOptions = tls_transport.Options;
+pub const cityhash = @import("cityhash.zig");
+pub const lz4 = @import("lz4.zig");
+pub const compression = @import("compression.zig");
 
 pub const ClientError = cherror.ClientError;
 pub const ServerError = cherror.ServerError;

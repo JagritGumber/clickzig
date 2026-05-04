@@ -49,10 +49,47 @@ pub fn main(init: std.process.Init) !void {
         try runDecimalIp(allocator, io);
     } else if (std.mem.eql(u8, scenario, "tuple-map")) {
         try runTupleMap(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "compression")) {
+        try runCompression(allocator, io);
     } else {
         std.debug.print("usage: smoke_connect [happy|ping|wrong-pass|unreachable|wrong-host|query-bytes]\n", .{});
         return error.UnknownScenario;
     }
+}
+
+fn runCompression(allocator: std.mem.Allocator, io: std.Io) !void {
+    // Connect with compression enabled. Server should send Data blocks
+    // wrapped in LZ4 compression frames; we decompress and parse.
+    var cfg = baseConfig(allocator);
+    cfg.compression = .Enable;
+    const client = try clickzig.Client.connectTcp(cfg, io, null, null);
+    defer client.close();
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+
+    var s = try client.query(
+        "SELECT number FROM numbers(100)",
+        arena.allocator(),
+        null,
+        .{ .compression = .Enable },
+    );
+    var rows: u64 = 0;
+    var sum: u64 = 0;
+    while (try s.next()) |p| switch (p) {
+        .data => |b| {
+            if (b.num_rows == 0) continue;
+            for (b.columns[0].column.UInt64) |n| {
+                sum += n;
+                rows += 1;
+            }
+        },
+        .end_of_stream => break,
+        .exception => |e| { std.debug.print("[compression] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        else => {},
+    };
+    if (rows != 100) return error.UnexpectedRowCount;
+    if (sum != 4950) return error.SumMismatch;
+    std.debug.print("[compression] OK: 100 rows summed to {d} via LZ4 frames\n", .{sum});
 }
 
 fn runTupleMap(allocator: std.mem.Allocator, io: std.Io) !void {

@@ -32,6 +32,7 @@ const varint = @import("varint.zig");
 const exception = @import("exception.zig");
 const block_mod = @import("block.zig");
 const cherror = @import("cherror.zig");
+const compression_mod = @import("compression.zig");
 
 pub const Progress = struct {
     read_rows: u64 = 0,
@@ -95,6 +96,10 @@ pub const ResultStream = struct {
     reader: *std.Io.Reader,
     allocator: std.mem.Allocator,
     server_revision: u64,
+    /// When .Enable, every Data-flavored packet body is wrapped in a
+    /// compression frame. Set by Client.query when the per-query
+    /// compression flag is on. Synthetic-byte tests leave it Disable.
+    compression: protocol.CompressionEnabled = .Disable,
     /// Hooks back into the parent Client so we can flip state back to
     /// .ready / .broken when the stream terminates. Held by value so
     /// no dangling-pointer hazard from a stack-local view; the inner
@@ -145,6 +150,18 @@ pub const ResultStream = struct {
     }
 
     fn readBlockAndCheck(self: *ResultStream) !block_mod.Block {
+        if (self.compression == .Enable) {
+            const frame = compression_mod.readFrame(self.reader, self.allocator) catch |e| {
+                self.markBroken();
+                return e;
+            };
+            defer self.allocator.free(frame);
+            var fr: std.Io.Reader = .fixed(frame);
+            return block_mod.readBlock(&fr, self.allocator, self.server_revision) catch |e| {
+                self.markBroken();
+                return e;
+            };
+        }
         return block_mod.readBlock(self.reader, self.allocator, self.server_revision) catch |e| {
             self.markBroken();
             return e;
