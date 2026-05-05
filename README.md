@@ -23,10 +23,15 @@ clickzig speaks the ClickHouse native TCP protocol (port 9000 / 9440 TLS) direct
 - `Client.insert()` for bulk INSERT in Native format
 
 **Column types**
-- Primitives: UInt8/16/32/64/128, Int8/16/32/64/128, Float32/64, String, Bool
-- Composite: Nullable(T), Array(T), FixedString(N), UUID
+- Primitives: UInt8/16/32/64/128/256, Int8/16/32/64/128/256, Float32/64, String, Bool
+- Composite: Nullable(T), Array(T), FixedString(N), UUID, Tuple(...), Map(K, V)
 - Aliases: Date, Date32, DateTime, DateTime64, Enum8, Enum16, IPv4, IPv6
-- Decimal(P, S) → Int32/Int64/Int128 based on precision (Decimal32/64/128 explicit aliases too)
+- Decimal(P, S) → Int32/Int64/Int128/Int256 based on precision (Decimal32/64/128/256 explicit aliases too)
+- LowCardinality(T) and LowCardinality(Nullable(T)) (read-side, materialized to T)
+
+**Compression**
+- LZ4 frames on both SELECT and INSERT (CityHash 1.0.2 frame checksum, vendored encoder + decoder)
+- ZSTD frames decoded on the read side via stdlib (no encoder yet)
 
 **Pool + DSN**
 - `Pool` with thread-safe acquire/release, broken-discard, optional max-lifetime expiry
@@ -37,11 +42,11 @@ clickzig speaks the ClickHouse native TCP protocol (port 9000 / 9440 TLS) direct
 
 ## known gaps before v0.16.0
 
-- **Compression (LZ4 / ZSTD)** — server replies are uncompressed by default; client always negotiates `CompressionEnabled.Disable`. Lands once CityHash 1.0.2 frozen + LZ4 codec are vendored.
-- **Decimal256** — needs i256; defer alongside compression work.
-- **Tuple / Map / LowCardinality** — column types not yet decoded.
-- **Async via `std.Io` fibers** — current API is sync.
-- **Parameterised queries** — bindings via `?`/`{name:Type}` placeholders not yet implemented.
+- **LowCardinality writes** — encoded only on the read side. Insert into LC columns by going through `INSERT ... SELECT` or by materializing via the inner type (server side adapts).
+- **Sparse / Dynamic / JSON** — surface as `error.UnsupportedColumnType`. Decoders need polymorphic-variant support that doesn't fit the v0.16.0 column union; deferred.
+- **Async via `std.Io` fibers** — current API is sync. Iterator-first stream contract is locked so the column-store decoder doesn't fight the API later.
+- **Parameterised queries** — bindings via `?`/`{name:Type}` placeholders not yet implemented; all queries are raw text + Native blocks for INSERT data.
+- **ZSTD encoder** — read side decodes ZSTD frames; write side ships LZ4 only.
 
 ## design decisions worth knowing up front
 
@@ -163,6 +168,29 @@ Connect errors are typed and granular. The OS-level cause flows into specific `C
 | `Cancelled` | caller's atomic bool flipped mid-handshake |
 | `ConnectionFailed` | catch-all for unmapped OS errors |
 
+## porting from other clients
+
+If you've used `clickhouse-go`, `clickhouse-rs` (klickhouse), or `clickhouse-cpp`, the **type-name strings are identical** — clickzig matches every type literal the server exposes. What differs is the in-memory shape you read back:
+
+| ClickHouse | clickzig shape | notes |
+|---|---|---|
+| `String` | `[][]u8` (one slice per row) | bytes are raw; not validated as UTF-8 |
+| `FixedString(N)` | `FixedString { width, data }` | `data.len = num_rows * width`; row i is `data[i*width..][0..width]` |
+| `Nullable(T)` | `*Nullable { mask, inner }` | `mask[i] == 1` means NULL; `inner.<TypeTag>[i]` holds the value |
+| `Array(T)` | `*Array { offsets, inner }` | row i = `inner[offsets[i-1] .. offsets[i]]` (offsets[-1] = 0) |
+| `Tuple(T1, T2, ...)` | `*Tuple { row_count, elements }` | `elements[k].<TypeTag>[i]` is the k-th element of row i |
+| `Map(K, V)` | `*Map { offsets, keys, values }` | wire layout = `Array(Tuple(K, V))`; pair-flat |
+| `Decimal(P, S)` | `Int32` / `Int64` / `Int128` / `Int256` | scaled int; divide by `10^S` to recover the rational |
+| `IPv4` | `UInt32` | host order; format manually |
+| `IPv6` | `FixedString { width=16 }` | 16 raw bytes per row |
+| `UUID` | `[][16]u8` | 16 raw bytes per row, big-endian |
+| `LowCardinality(T)` | materialized `T` | dict + indexes is decoded transparently; you see plain T |
+| `LowCardinality(Nullable(T))` | materialized `*Nullable` | LC index 0 maps to `mask[i] = 1` |
+
+**Allocation model.** Each `Block` owns its column buffers via the per-query allocator you passed to `client.query()`. Pass an arena and free in O(1) at end-of-query — clickzig deliberately does not pool buffers internally because that fights cancellation semantics.
+
+**INSERT shape.** `client.insert()` takes `InsertColumn[]` slices that mirror the read shape (you build `[]u32`, `[][]u8`, `Nullable { mask, inner: .{ .UInt32 = ... } }`, and so on, then hand the slice in). No reflection-driven row marshalling — the row-of-struct -> column-of-arrays conversion is yours to write or generate.
+
 ## supported ClickHouse versions
 
 Tested against ClickHouse 26.3.x. Pinned at `CLIENT_REVISION = 54_466`, which negotiates correctly against any server reporting 54_466 or higher. Older servers (down to ~21.x) should work; newer-revision fields are dormant until the pin is bumped.
@@ -174,14 +202,12 @@ Tested against ClickHouse 26.3.x. Pinned at `CLIENT_REVISION = 54_466`, which ne
 zig build test
 
 # end-to-end smoke against a running ClickHouse on localhost:9000
-zig build smoke -- happy
-zig build smoke -- ping
-zig build smoke -- wrong-pass
-zig build smoke -- unreachable
-zig build smoke -- wrong-host
+zig build smoke -- <scenario>
 ```
 
-The smoke harness assumes `clickhouse/clickhouse-server:26.3` running locally with `default:test` credentials. CI runs all five against a service container on every push.
+Scenarios: `happy`, `ping`, `wrong-pass`, `unreachable`, `wrong-host`, `query-bytes`, `query-mixed`, `insert-roundtrip`, `nullable-roundtrip`, `complex-types`, `tuple-map`, `decimal-ip`, `pool`, `dsn`, `compression`, `insert-compression`, `lowcardinality`.
+
+The smoke harness assumes `clickhouse/clickhouse-server:26.3` running locally with `default:test` credentials. CI runs every scenario against a service container on every push.
 
 ### release pipeline
 
