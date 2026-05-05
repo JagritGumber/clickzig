@@ -146,13 +146,34 @@ pub const Map = struct {
 
 pub const Error = error{
     UnsupportedColumnType,
+    /// Wire-format violation specific to LowCardinality: bad version,
+    /// missing dictionary, malformed serialization_type, out-of-range
+    /// index, or unknown index integer width. Distinct from
+    /// `UnsupportedColumnType` so production logs can disambiguate
+    /// "type we don't decode" from "server sent garbage we can't trust."
+    LowCardinalityCorruptFrame,
 };
+
+/// LowCardinality(T) on-wire constants. Mirrors upstream
+/// `SerializationLowCardinality.cpp`. The serialization-version prefix
+/// is written by upstream `serializeBinaryBulkStatePrefix`; the per-block
+/// `serialization_type` packs the index integer width in the low byte
+/// (0=UInt8 ... 3=UInt64) and three feature bits.
+const LC_KEY_VERSION: u64 = 1;
+const LC_INDEX_TYPE_MASK: u64 = 0xff;
+const LC_INDEX_UINT8: u64 = 0;
+const LC_INDEX_UINT16: u64 = 1;
+const LC_INDEX_UINT32: u64 = 2;
+const LC_INDEX_UINT64: u64 = 3;
+const LC_NEED_GLOBAL_DICT_BIT: u64 = 1 << 8;
+const LC_HAS_ADDITIONAL_KEYS_BIT: u64 = 1 << 9;
+const LC_NEED_UPDATE_DICT_BIT: u64 = 1 << 10;
 
 /// Map a ClickHouse type-name string to a TypeId. Handles both bare
 /// names ("UInt32", "Date") and parameterised forms ("DateTime('UTC')",
-/// "DateTime64(3, 'UTC')") via prefix match. Returns null for types
-/// we don't yet decode (Array, Tuple, Map, Nullable, LowCardinality,
-/// Decimal, FixedString, IPv4/IPv6, Enum16, etc.).
+/// "DateTime64(3, 'UTC')") via prefix match. Returns null for parametric
+/// composite types (Array, Tuple, Map, Nullable, LowCardinality,
+/// FixedString) — `readColumn` dispatches those above the TypeId table.
 pub fn typeIdFromName(type_name: []const u8) ?TypeId {
     const eq = std.mem.eql;
     const startsWith = std.mem.startsWith;
@@ -263,6 +284,9 @@ pub fn readColumn(
         const values = try readColumn(reader, allocator, kv.value, total);
         ptr.* = .{ .offsets = offsets, .keys = keys, .values = values };
         return .{ .Map = ptr };
+    }
+    if (extractLowCardinalityInner(type_name)) |inner_name| {
+        return readLowCardinality(reader, allocator, inner_name, num_rows);
     }
     if (extractTupleArgs(type_name)) |args_str| {
         const ptr = try allocator.create(Tuple);
@@ -436,6 +460,196 @@ pub fn extractFixedStringWidth(type_name: []const u8) ?usize {
     if (!std.mem.endsWith(u8, type_name, ")")) return null;
     const inside = type_name[prefix.len .. type_name.len - 1];
     return std.fmt.parseInt(usize, inside, 10) catch null;
+}
+
+/// Returns the inner type name if `type_name` matches "LowCardinality(...)".
+pub fn extractLowCardinalityInner(type_name: []const u8) ?[]const u8 {
+    const prefix = "LowCardinality(";
+    if (!std.mem.startsWith(u8, type_name, prefix)) return null;
+    if (!std.mem.endsWith(u8, type_name, ")")) return null;
+    return type_name[prefix.len .. type_name.len - 1];
+}
+
+/// Decode a LowCardinality(T) column body. Materializes the (dictionary,
+/// indexes) wire layout into a regular Column<T> with `num_rows` entries
+/// so callers see the same shape they would for an unwrapped T column.
+/// LC(Nullable(T)) is materialized as Nullable(T) where mask[i]=1 means
+/// the wire-side index pointed at the dictionary's null sentinel (idx 0).
+///
+/// State assumption: each block carries its own version+serialization
+/// prefix, so this function is safe to call per-block. If the server is
+/// configured for cross-block stream state (uncommon), the second block
+/// would fail to decode here — out of scope for v0.16.0.
+fn readLowCardinality(
+    reader: *std.Io.Reader,
+    allocator: std.mem.Allocator,
+    inner_name: []const u8,
+    num_rows: u64,
+) anyerror!Column {
+    const inner_is_nullable = extractNullableInner(inner_name);
+    // For LC(Nullable(T)) the dictionary stores T (NOT Nullable(T));
+    // index 0 is the null sentinel. For LC(T) the dictionary is T as-is.
+    const dict_inner_name = inner_is_nullable orelse inner_name;
+
+    if (num_rows == 0) {
+        // Empty block: no LC payload was emitted (matches upstream and
+        // klickhouse). Return an empty materialized column matching the
+        // surface type the caller expects.
+        if (inner_is_nullable) |_| {
+            const ptr = try allocator.create(Nullable);
+            errdefer allocator.destroy(ptr);
+            const mask = try allocator.alloc(u8, 0);
+            errdefer allocator.free(mask);
+            ptr.* = .{
+                .mask = mask,
+                .inner = try readColumn(reader, allocator, dict_inner_name, 0),
+            };
+            return .{ .Nullable = ptr };
+        }
+        return readColumn(reader, allocator, dict_inner_name, 0);
+    }
+
+    const key_version = try reader.takeInt(u64, .little);
+    if (key_version != LC_KEY_VERSION) return error.LowCardinalityCorruptFrame;
+
+    const ser_type = try reader.takeInt(u64, .little);
+    const idx_type = ser_type & LC_INDEX_TYPE_MASK;
+    const has_global_dict = (ser_type & LC_NEED_GLOBAL_DICT_BIT) != 0;
+    const has_add_keys = (ser_type & LC_HAS_ADDITIONAL_KEYS_BIT) != 0;
+
+    var global_dict: ?Column = null;
+    defer if (global_dict) |g| g.deinit(allocator);
+    if (has_global_dict) {
+        const dict_size = try reader.takeInt(u64, .little);
+        global_dict = try readColumn(reader, allocator, dict_inner_name, dict_size);
+    }
+
+    var add_keys: ?Column = null;
+    defer if (add_keys) |a| a.deinit(allocator);
+    if (has_add_keys) {
+        const add_size = try reader.takeInt(u64, .little);
+        add_keys = try readColumn(reader, allocator, dict_inner_name, add_size);
+    }
+
+    // The active dictionary for materialization: prefer per-block
+    // additional keys (the common case for ClickHouse server output).
+    const dict = add_keys orelse global_dict orelse return error.LowCardinalityCorruptFrame;
+
+    const num_indexes = try reader.takeInt(u64, .little);
+    if (num_indexes != num_rows) return error.LowCardinalityCorruptFrame;
+
+    const indexes = try readLcIndexes(reader, allocator, idx_type, num_rows);
+    defer allocator.free(indexes);
+
+    const dict_len = dict.len();
+    for (indexes) |idx| {
+        if (idx >= dict_len) return error.LowCardinalityCorruptFrame;
+    }
+
+    if (inner_is_nullable) |_| {
+        return materializeNullableLc(allocator, dict, indexes);
+    }
+    return materializeLc(allocator, dict, indexes);
+}
+
+fn readLcIndexes(
+    reader: *std.Io.Reader,
+    allocator: std.mem.Allocator,
+    idx_type: u64,
+    n: u64,
+) ![]u64 {
+    const n_usize: usize = @intCast(n);
+    const out = try allocator.alloc(u64, n_usize);
+    errdefer allocator.free(out);
+    switch (idx_type) {
+        LC_INDEX_UINT8 => {
+            const buf = try allocator.alloc(u8, n_usize);
+            defer allocator.free(buf);
+            try reader.readSliceAll(buf);
+            for (buf, 0..) |b, i| out[i] = b;
+        },
+        LC_INDEX_UINT16 => {
+            const buf = try allocator.alloc(u16, n_usize);
+            defer allocator.free(buf);
+            try reader.readSliceAll(std.mem.sliceAsBytes(buf));
+            for (buf, 0..) |v, i| out[i] = v;
+        },
+        LC_INDEX_UINT32 => {
+            const buf = try allocator.alloc(u32, n_usize);
+            defer allocator.free(buf);
+            try reader.readSliceAll(std.mem.sliceAsBytes(buf));
+            for (buf, 0..) |v, i| out[i] = v;
+        },
+        LC_INDEX_UINT64 => try reader.readSliceAll(std.mem.sliceAsBytes(out)),
+        else => return error.LowCardinalityCorruptFrame,
+    }
+    return out;
+}
+
+fn cloneByIndexT(
+    comptime T: type,
+    allocator: std.mem.Allocator,
+    src: []const T,
+    indexes: []const u64,
+) ![]T {
+    const out = try allocator.alloc(T, indexes.len);
+    errdefer allocator.free(out);
+    for (indexes, 0..) |idx, i| out[i] = src[@intCast(idx)];
+    return out;
+}
+
+fn materializeLc(allocator: std.mem.Allocator, dict: Column, indexes: []const u64) !Column {
+    return switch (dict) {
+        .UInt8 => |s| .{ .UInt8 = try cloneByIndexT(u8, allocator, s, indexes) },
+        .UInt16 => |s| .{ .UInt16 = try cloneByIndexT(u16, allocator, s, indexes) },
+        .UInt32 => |s| .{ .UInt32 = try cloneByIndexT(u32, allocator, s, indexes) },
+        .UInt64 => |s| .{ .UInt64 = try cloneByIndexT(u64, allocator, s, indexes) },
+        .UInt128 => |s| .{ .UInt128 = try cloneByIndexT(u128, allocator, s, indexes) },
+        .UInt256 => |s| .{ .UInt256 = try cloneByIndexT(u256, allocator, s, indexes) },
+        .Int8 => |s| .{ .Int8 = try cloneByIndexT(i8, allocator, s, indexes) },
+        .Int16 => |s| .{ .Int16 = try cloneByIndexT(i16, allocator, s, indexes) },
+        .Int32 => |s| .{ .Int32 = try cloneByIndexT(i32, allocator, s, indexes) },
+        .Int64 => |s| .{ .Int64 = try cloneByIndexT(i64, allocator, s, indexes) },
+        .Int128 => |s| .{ .Int128 = try cloneByIndexT(i128, allocator, s, indexes) },
+        .Int256 => |s| .{ .Int256 = try cloneByIndexT(i256, allocator, s, indexes) },
+        .Float32 => |s| .{ .Float32 = try cloneByIndexT(f32, allocator, s, indexes) },
+        .Float64 => |s| .{ .Float64 = try cloneByIndexT(f64, allocator, s, indexes) },
+        .UUID => |s| .{ .UUID = try cloneByIndexT([16]u8, allocator, s, indexes) },
+        .String => |rows| blk: {
+            const out = try allocator.alloc([]u8, indexes.len);
+            errdefer allocator.free(out);
+            var produced: usize = 0;
+            errdefer for (out[0..produced]) |r| allocator.free(r);
+            for (indexes, 0..) |idx, i| {
+                out[i] = try allocator.dupe(u8, rows[@intCast(idx)]);
+                produced = i + 1;
+            }
+            break :blk .{ .String = out };
+        },
+        .FixedString => |fs| blk: {
+            const out = try allocator.alloc(u8, indexes.len * fs.width);
+            errdefer allocator.free(out);
+            for (indexes, 0..) |idx, i| {
+                const src_off: usize = @as(usize, @intCast(idx)) * fs.width;
+                @memcpy(out[i * fs.width ..][0..fs.width], fs.data[src_off..][0..fs.width]);
+            }
+            break :blk .{ .FixedString = .{ .width = fs.width, .data = out } };
+        },
+        else => error.UnsupportedColumnType,
+    };
+}
+
+fn materializeNullableLc(allocator: std.mem.Allocator, dict: Column, indexes: []const u64) !Column {
+    const ptr = try allocator.create(Nullable);
+    errdefer allocator.destroy(ptr);
+    const mask = try allocator.alloc(u8, indexes.len);
+    errdefer allocator.free(mask);
+    for (indexes, 0..) |idx, i| mask[i] = if (idx == 0) 1 else 0;
+    ptr.* = .{
+        .mask = mask,
+        .inner = try materializeLc(allocator, dict, indexes),
+    };
+    return .{ .Nullable = ptr };
 }
 
 /// Returns the inner type name if `type_name` matches "Nullable(...)",
@@ -676,7 +890,204 @@ test "readColumn String round-trips multibyte rows" {
 
 test "readColumn rejects unknown type" {
     var r: std.Io.Reader = .fixed(&[_]u8{});
-    // LowCardinality decoder lands later; this is the v0.16.0
-    // sentinel for "type we don't yet handle".
-    try testing.expectError(error.UnsupportedColumnType, readColumn(&r, testing.allocator, "LowCardinality(String)", 0));
+    // Pick a column type genuinely outside v0.16.0's coverage.
+    try testing.expectError(error.UnsupportedColumnType, readColumn(&r, testing.allocator, "JSON", 0));
+}
+
+test "extractLowCardinalityInner peels the wrapper" {
+    try testing.expectEqualStrings("String", extractLowCardinalityInner("LowCardinality(String)").?);
+    try testing.expectEqualStrings("Nullable(UInt32)", extractLowCardinalityInner("LowCardinality(Nullable(UInt32))").?);
+    try testing.expectEqual(@as(?[]const u8, null), extractLowCardinalityInner("String"));
+}
+
+test "LowCardinality(String) materializes through dict + indexes" {
+    const ally = testing.allocator;
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+
+    // Wire layout for 4 rows of LC(String) with a 3-element add-keys dict.
+    try w.writeInt(u64, LC_KEY_VERSION, .little);
+    try w.writeInt(u64, LC_INDEX_UINT8 | LC_HAS_ADDITIONAL_KEYS_BIT, .little);
+    try w.writeInt(u64, 3, .little); // add_keys size
+    try wire.writeStringBinary(&w, "alpha");
+    try wire.writeStringBinary(&w, "beta");
+    try wire.writeStringBinary(&w, "gamma");
+    try w.writeInt(u64, 4, .little); // num_indexes
+    try w.writeAll(&[_]u8{ 0, 1, 2, 1 }); // 4 UInt8 indexes
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col = try readColumn(&r, ally, "LowCardinality(String)", 4);
+    defer col.deinit(ally);
+    try testing.expectEqualStrings("alpha", col.String[0]);
+    try testing.expectEqualStrings("beta", col.String[1]);
+    try testing.expectEqualStrings("gamma", col.String[2]);
+    try testing.expectEqualStrings("beta", col.String[3]);
+    try testing.expectEqual(@as(usize, 4), col.len());
+}
+
+test "LowCardinality(Nullable(String)) marks index-0 rows as null" {
+    const ally = testing.allocator;
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+
+    // 5 rows; dict = ["", "x", "y"]. idx 0 is the null sentinel.
+    try w.writeInt(u64, LC_KEY_VERSION, .little);
+    try w.writeInt(u64, LC_INDEX_UINT8 | LC_HAS_ADDITIONAL_KEYS_BIT, .little);
+    try w.writeInt(u64, 3, .little);
+    try wire.writeStringBinary(&w, "");
+    try wire.writeStringBinary(&w, "x");
+    try wire.writeStringBinary(&w, "y");
+    try w.writeInt(u64, 5, .little);
+    try w.writeAll(&[_]u8{ 1, 0, 2, 0, 1 });
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col = try readColumn(&r, ally, "LowCardinality(Nullable(String))", 5);
+    defer col.deinit(ally);
+    const n = col.Nullable;
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0, 1, 0 }, n.mask);
+    try testing.expectEqualStrings("x", n.inner.String[0]);
+    try testing.expectEqualStrings("y", n.inner.String[2]);
+    try testing.expectEqualStrings("x", n.inner.String[4]);
+}
+
+test "LowCardinality rejects out-of-range index" {
+    const ally = testing.allocator;
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeInt(u64, LC_KEY_VERSION, .little);
+    try w.writeInt(u64, LC_INDEX_UINT8 | LC_HAS_ADDITIONAL_KEYS_BIT, .little);
+    try w.writeInt(u64, 2, .little);
+    try wire.writeStringBinary(&w, "a");
+    try wire.writeStringBinary(&w, "b");
+    try w.writeInt(u64, 1, .little);
+    try w.writeAll(&[_]u8{42}); // out of range for a 2-element dict
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    try testing.expectError(error.LowCardinalityCorruptFrame, readColumn(&r, ally, "LowCardinality(String)", 1));
+}
+
+test "LowCardinality(FixedString(4)) materializes preserving width" {
+    const ally = testing.allocator;
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeInt(u64, LC_KEY_VERSION, .little);
+    try w.writeInt(u64, LC_INDEX_UINT8 | LC_HAS_ADDITIONAL_KEYS_BIT, .little);
+    try w.writeInt(u64, 2, .little);
+    try w.writeAll("aaaa");
+    try w.writeAll("bbbb");
+    try w.writeInt(u64, 3, .little);
+    try w.writeAll(&[_]u8{ 1, 0, 1 });
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col = try readColumn(&r, ally, "LowCardinality(FixedString(4))", 3);
+    defer col.deinit(ally);
+    try testing.expectEqual(@as(usize, 4), col.FixedString.width);
+    try testing.expectEqualSlices(u8, "bbbbaaaabbbb", col.FixedString.data);
+}
+
+test "LowCardinality(Nullable(UInt32)) routes through numeric materializer" {
+    const ally = testing.allocator;
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeInt(u64, LC_KEY_VERSION, .little);
+    try w.writeInt(u64, LC_INDEX_UINT8 | LC_HAS_ADDITIONAL_KEYS_BIT, .little);
+    try w.writeInt(u64, 3, .little);
+    try w.writeInt(u32, 0, .little); // null sentinel default
+    try w.writeInt(u32, 42, .little);
+    try w.writeInt(u32, 99, .little);
+    try w.writeInt(u64, 4, .little);
+    try w.writeAll(&[_]u8{ 0, 1, 2, 0 });
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col = try readColumn(&r, ally, "LowCardinality(Nullable(UInt32))", 4);
+    defer col.deinit(ally);
+    const n = col.Nullable;
+    try testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 0, 1 }, n.mask);
+    try testing.expectEqual(@as(u32, 42), n.inner.UInt32[1]);
+    try testing.expectEqual(@as(u32, 99), n.inner.UInt32[2]);
+}
+
+test "LowCardinality with UInt64 indexes" {
+    const ally = testing.allocator;
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeInt(u64, LC_KEY_VERSION, .little);
+    try w.writeInt(u64, LC_INDEX_UINT64 | LC_HAS_ADDITIONAL_KEYS_BIT, .little);
+    try w.writeInt(u64, 2, .little);
+    try wire.writeStringBinary(&w, "alpha");
+    try wire.writeStringBinary(&w, "beta");
+    try w.writeInt(u64, 3, .little);
+    try w.writeInt(u64, 1, .little);
+    try w.writeInt(u64, 0, .little);
+    try w.writeInt(u64, 1, .little);
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col = try readColumn(&r, ally, "LowCardinality(String)", 3);
+    defer col.deinit(ally);
+    try testing.expectEqualStrings("beta", col.String[0]);
+    try testing.expectEqualStrings("alpha", col.String[1]);
+    try testing.expectEqualStrings("beta", col.String[2]);
+}
+
+test "LowCardinality(String) with num_rows == 0 returns empty without reading" {
+    const ally = testing.allocator;
+    var r: std.Io.Reader = .fixed(&[_]u8{}); // zero bytes available
+    const col = try readColumn(&r, ally, "LowCardinality(String)", 0);
+    defer col.deinit(ally);
+    try testing.expectEqual(@as(usize, 0), col.len());
+    try testing.expectEqual(@as(usize, 0), col.String.len);
+}
+
+test "LowCardinality(Nullable(String)) with num_rows == 0 still produces a Nullable wrapper" {
+    const ally = testing.allocator;
+    var r: std.Io.Reader = .fixed(&[_]u8{});
+    const col = try readColumn(&r, ally, "LowCardinality(Nullable(String))", 0);
+    defer col.deinit(ally);
+    try testing.expectEqual(@as(usize, 0), col.len());
+    try testing.expectEqual(@as(usize, 0), col.Nullable.mask.len);
+}
+
+test "LowCardinality with UInt32 indexes" {
+    const ally = testing.allocator;
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeInt(u64, LC_KEY_VERSION, .little);
+    try w.writeInt(u64, LC_INDEX_UINT32 | LC_HAS_ADDITIONAL_KEYS_BIT, .little);
+    try w.writeInt(u64, 2, .little);
+    try wire.writeStringBinary(&w, "hot");
+    try wire.writeStringBinary(&w, "cold");
+    try w.writeInt(u64, 4, .little);
+    try w.writeInt(u32, 0, .little);
+    try w.writeInt(u32, 1, .little);
+    try w.writeInt(u32, 1, .little);
+    try w.writeInt(u32, 0, .little);
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col = try readColumn(&r, ally, "LowCardinality(String)", 4);
+    defer col.deinit(ally);
+    try testing.expectEqualStrings("hot", col.String[0]);
+    try testing.expectEqualStrings("cold", col.String[1]);
+    try testing.expectEqualStrings("cold", col.String[2]);
+    try testing.expectEqualStrings("hot", col.String[3]);
+}
+
+test "LowCardinality(UInt32) numeric round-trips via UInt16 indexes" {
+    const ally = testing.allocator;
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeInt(u64, LC_KEY_VERSION, .little);
+    try w.writeInt(u64, LC_INDEX_UINT16 | LC_HAS_ADDITIONAL_KEYS_BIT, .little);
+    try w.writeInt(u64, 3, .little);
+    try w.writeInt(u32, 100, .little);
+    try w.writeInt(u32, 200, .little);
+    try w.writeInt(u32, 300, .little);
+    try w.writeInt(u64, 3, .little);
+    try w.writeInt(u16, 2, .little);
+    try w.writeInt(u16, 0, .little);
+    try w.writeInt(u16, 1, .little);
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col = try readColumn(&r, ally, "LowCardinality(UInt32)", 3);
+    defer col.deinit(ally);
+    try testing.expectEqualSlices(u32, &[_]u32{ 300, 100, 200 }, col.UInt32);
 }

@@ -53,10 +53,98 @@ pub fn main(init: std.process.Init) !void {
         try runCompression(allocator, io);
     } else if (std.mem.eql(u8, scenario, "insert-compression")) {
         try runInsertCompression(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "lowcardinality")) {
+        try runLowCardinality(allocator, io);
     } else {
-        std.debug.print("usage: smoke_connect [happy|ping|wrong-pass|unreachable|wrong-host|query-bytes|query-mixed|insert-roundtrip|nullable-roundtrip|complex-types|pool|dsn|decimal-ip|tuple-map|compression|insert-compression]\n", .{});
+        std.debug.print("usage: smoke_connect [happy|ping|wrong-pass|unreachable|wrong-host|query-bytes|query-mixed|insert-roundtrip|nullable-roundtrip|complex-types|pool|dsn|decimal-ip|tuple-map|compression|insert-compression|lowcardinality]\n", .{});
         return error.UnknownScenario;
     }
+}
+
+fn runLowCardinality(allocator: std.mem.Allocator, io: std.Io) !void {
+    // CREATE a table with both LowCardinality(String) and
+    // LowCardinality(Nullable(String)), populate via server-side
+    // INSERT...SELECT (we don't ship client-side LC encoding yet),
+    // then SELECT and verify the materialized data matches the
+    // pattern we generated server-side.
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    defer client.close();
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+
+    {
+        var s = try client.query("DROP TABLE IF EXISTS smoke_lc", arena.allocator(), null, .{});
+        while (try s.next()) |p| switch (p) {
+            .end_of_stream => break,
+            .exception => |e| { std.debug.print("[lc] drop failed: {s}\n", .{e.message}); return error.SetupFailed; },
+            else => {},
+        };
+    }
+    {
+        var s = try client.query(
+            \\CREATE TABLE smoke_lc (
+            \\    k UInt32,
+            \\    v LowCardinality(String),
+            \\    m LowCardinality(Nullable(String))
+            \\) ENGINE = Memory
+        , arena.allocator(), null, .{});
+        while (try s.next()) |p| switch (p) {
+            .end_of_stream => break,
+            .exception => |e| { std.debug.print("[lc] create failed: {s}\n", .{e.message}); return error.SetupFailed; },
+            else => {},
+        };
+    }
+    {
+        var s = try client.query(
+            \\INSERT INTO smoke_lc
+            \\SELECT
+            \\    number AS k,
+            \\    ['alpha', 'beta', 'gamma'][(number % 3) + 1] AS v,
+            \\    if(number % 4 = 0, NULL, ['x', 'y', 'z'][(number % 3) + 1]) AS m
+            \\FROM numbers(20)
+        , arena.allocator(), null, .{});
+        while (try s.next()) |p| switch (p) {
+            .end_of_stream => break,
+            .exception => |e| { std.debug.print("[lc] insert-select failed: {s}\n", .{e.message}); return error.SetupFailed; },
+            else => {},
+        };
+    }
+
+    var s = try client.query("SELECT k, v, m FROM smoke_lc ORDER BY k", arena.allocator(), null, .{});
+    var seen: u32 = 0;
+    var nulls: u32 = 0;
+    while (try s.next()) |p| switch (p) {
+        .data => |b| {
+            if (b.num_rows == 0) continue;
+            const ks = b.columns[0].column.UInt32;
+            const vs = b.columns[1].column.String;
+            const ms = b.columns[2].column.Nullable;
+            var i: usize = 0;
+            while (i < b.num_rows) : (i += 1) {
+                const k = ks[i];
+                const expected_v = ([_][]const u8{ "alpha", "beta", "gamma" })[k % 3];
+                if (!std.mem.eql(u8, vs[i], expected_v)) {
+                    std.debug.print("[lc] v mismatch at k={d}: got '{s}' want '{s}'\n", .{ k, vs[i], expected_v });
+                    return error.LcValueMismatch;
+                }
+                if (k % 4 == 0) {
+                    if (ms.mask[i] != 1) return error.LcNullableMismatch;
+                    nulls += 1;
+                } else {
+                    if (ms.mask[i] != 0) return error.LcNullableMismatch;
+                    const expected_m = ([_][]const u8{ "x", "y", "z" })[k % 3];
+                    if (!std.mem.eql(u8, ms.inner.String[i], expected_m)) return error.LcValueMismatch;
+                }
+            }
+            seen += @intCast(b.num_rows);
+        },
+        .end_of_stream => break,
+        .exception => |e| { std.debug.print("[lc] select failed: {s}\n", .{e.message}); return error.QueryFailed; },
+        else => {},
+    };
+    if (seen != 20) return error.UnexpectedRowCount;
+    if (nulls != 5) return error.UnexpectedNullCount; // k = 0, 4, 8, 12, 16
+    std.debug.print("[lc] OK: 20 rows, 5 nulls via LowCardinality(Nullable(String)) sentinel\n", .{});
 }
 
 fn runCompression(allocator: std.mem.Allocator, io: std.Io) !void {
