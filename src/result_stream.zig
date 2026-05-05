@@ -121,20 +121,23 @@ pub const ResultStream = struct {
             return e;
         };
         // Per upstream Connection::receivePacket: Data / Totals / Extremes
-        // ride through `maybe_compressed_in` (compressed when compression
-        // is on), but Log and ProfileEvents are always read via raw `*in`
-        // (initBlockLogsInput / initBlockProfileEventsInput both wrap
-        // the raw stream, never the compressed one). The asymmetry is
-        // load-bearing — without it, an LZ4-on session hangs on the
-        // first ProfileEvents packet because we look for a frame header
-        // where there isn't one.
+        // always ride through `maybe_compressed_in` when general
+        // compression is on. Log and ProfileEvents are revision-gated:
+        // `initBlockLogsInput` / `initBlockProfileEventsInput` wrap raw
+        // `*in` BELOW WITH_COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS (54_481)
+        // and `maybe_compressed_in` AT or above it. At our pinned
+        // CLIENT_REVISION = 54_466 the gate is dormant and these packets
+        // are always uncompressed; encoding the gate now keeps a future
+        // revision bump from silently hanging on the first Log packet.
         const compressed_body = self.compression == .Enable;
+        const compressed_log_or_pe = self.compression == .Enable
+            and self.server_revision >= protocol.Revision.WITH_COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS;
         switch (packet_id) {
             .Data => return .{ .data = try self.readBlockAndCheck(compressed_body) },
             .Totals => return .{ .totals = try self.readBlockAndCheck(compressed_body) },
             .Extremes => return .{ .extremes = try self.readBlockAndCheck(compressed_body) },
-            .Log => return .{ .log = try self.readBlockAndCheck(false) },
-            .ProfileEvents => return .{ .profile_events = try self.readBlockAndCheck(false) },
+            .Log => return .{ .log = try self.readBlockAndCheck(compressed_log_or_pe) },
+            .ProfileEvents => return .{ .profile_events = try self.readBlockAndCheck(compressed_log_or_pe) },
             .Progress => return .{ .progress = try self.readProgress() },
             .ProfileInfo => return .{ .profile_info = try self.readProfileInfo() },
             .TableColumns => return .{ .table_columns = try self.readTableColumns() },
@@ -417,13 +420,14 @@ test "ResultStream compressed Data round-trips a 1-col 1-row block + asserts exa
     try testing.expectEqual(@as(u8, 42), p.data.columns[0].column.UInt8[0]);
 }
 
-test "ResultStream with compression on reads ProfileEvents UNCOMPRESSED" {
-    // Regression lock: even when self.compression == .Enable, ProfileEvents
-    // (and Log) are sent without a compression frame. Upstream
+test "ResultStream with compression on reads ProfileEvents UNCOMPRESSED below the gate" {
+    // Regression lock: at server_revision < WITH_COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS
+    // (54_481), ProfileEvents (and Log) are sent without a compression
+    // frame even when general compression is on. Upstream
     // initBlockProfileEventsInput / initBlockLogsInput wrap the raw
-    // stream, never maybe_compressed_in. Treating the body as compressed
-    // hangs the connection on the first Profile/Log packet because
-    // we look for a frame header where there isn't one.
+    // stream below this gate. Treating the body as compressed hangs the
+    // connection on the first Profile/Log packet because we look for a
+    // frame header where there isn't one.
     const ally = testing.allocator;
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
@@ -444,6 +448,46 @@ test "ResultStream with compression on reads ProfileEvents UNCOMPRESSED" {
         .reader = &r,
         .allocator = ally,
         .server_revision = protocol.CLIENT_REVISION,
+        .compression = .Enable,
+    };
+    const p = (try stream.next()).?;
+    try testing.expect(p == .profile_events);
+    defer p.profile_events.deinit();
+    try testing.expect(p.profile_events.isEmpty());
+}
+
+test "ResultStream at revision >= 54_481 reads ProfileEvents COMPRESSED via the gate" {
+    // Forward-compat lock: when the negotiated revision is at or above
+    // WITH_COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS (54_481), the server
+    // wraps Log/ProfileEvents block bodies in a compression frame just
+    // like Data/Totals/Extremes. The gate in ResultStream.next must
+    // trigger the compressed read path. Today this is dead code at
+    // pinned CLIENT_REVISION = 54_466, but a future bump must not
+    // silently regress it — this test is the only thing that catches
+    // a wrong-direction gate flip.
+    const ally = testing.allocator;
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+
+    try varint.writeVarUInt(&w, @intFromEnum(protocol.ServerPacket.ProfileEvents));
+    try wire.writeStringBinary(&w, ""); // uncompressed table_name
+    // Body: BlockInfo + 0 cols + 0 rows, written into the frame.
+    var body_buf: [32]u8 = undefined;
+    var bw: std.Io.Writer = .fixed(&body_buf);
+    try varint.writeVarUInt(&bw, 1);
+    try bw.writeByte(0);
+    try varint.writeVarUInt(&bw, 2);
+    try bw.writeInt(i32, -1, .little);
+    try varint.writeVarUInt(&bw, 0);
+    try varint.writeVarUInt(&bw, 0);
+    try varint.writeVarUInt(&bw, 0);
+    try compression_mod.writeFrameLz4(&w, ally, bw.buffered());
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var stream: ResultStream = .{
+        .reader = &r,
+        .allocator = ally,
+        .server_revision = protocol.Revision.WITH_COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS,
         .compression = .Enable,
     };
     const p = (try stream.next()).?;

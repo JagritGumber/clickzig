@@ -68,6 +68,15 @@ pub const Revision = struct {
     pub const WITH_SERVER_SETTINGS: u64 = 54_474;
     pub const WITH_QUERY_PLAN_SERIALIZATION: u64 = 54_477;
     pub const WITH_VERSIONED_CLUSTER_FUNCTION_PROTOCOL: u64 = 54_479;
+    /// Server starts compressing Log and ProfileEvents block bodies via
+    /// `maybe_compressed_in` at this revision (upstream
+    /// DBMS_MIN_REVISION_WITH_COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS).
+    /// Below this gate, Log/ProfileEvents always ride raw `*in` even
+    /// when general compression is on. Any client codepath that reads
+    /// these packets while compression is enabled MUST gate the
+    /// per-packet `compressed_body` decision on this revision so a
+    /// future CLIENT_REVISION bump doesn't silently desync.
+    pub const WITH_COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS: u64 = 54_481;
 };
 
 /// Packet types sent by the client to the server.
