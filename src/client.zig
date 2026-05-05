@@ -444,29 +444,20 @@ pub const Client = struct {
             self.state = .broken;
             return mapWriteErrQuery(e);
         };
-        if (opts.compression == .Enable) {
-            // Buffer the body, wrap in compression frame.
-            var body_alloc: std.heap.ArenaAllocator = .init(self.config.control_allocator);
-            defer body_alloc.deinit();
-            var body_buf: std.Io.Writer.Allocating = .init(body_alloc.allocator());
-            defer body_buf.deinit();
-            query_mod.writeEmptyBlockBody(&body_buf.writer, negotiated) catch |e| {
-                self.is_broken = true;
-                self.state = .broken;
-                return mapWriteErrQuery(e);
-            };
-            compression_mod.writeFrameLz4(self.transport.writer(), body_alloc.allocator(), body_buf.written()) catch |e| {
-                self.is_broken = true;
-                self.state = .broken;
-                return mapWriteErrQuery(e);
-            };
-        } else {
-            query_mod.writeEmptyBlockBody(self.transport.writer(), negotiated) catch |e| {
-                self.is_broken = true;
-                self.state = .broken;
-                return mapWriteErrQuery(e);
-            };
-        }
+        var body_alloc: std.heap.ArenaAllocator = .init(self.config.control_allocator);
+        defer body_alloc.deinit();
+        var body_buf: std.Io.Writer.Allocating = .init(body_alloc.allocator());
+        defer body_buf.deinit();
+        query_mod.writeEmptyBlockBody(&body_buf.writer, negotiated) catch |e| {
+            self.is_broken = true;
+            self.state = .broken;
+            return mapWriteErrQuery(e);
+        };
+        compression_mod.writeMaybeCompressed(self.transport.writer(), body_alloc.allocator(), body_buf.written(), opts.compression) catch |e| {
+            self.is_broken = true;
+            self.state = .broken;
+            return mapWriteErrQuery(e);
+        };
         self.transport.writer().flush() catch |e| {
             self.is_broken = true;
             self.state = .broken;
@@ -514,138 +505,191 @@ pub const Client = struct {
     /// accepting our data block.
     pub fn insert(
         self: *Client,
-    query_text: []const u8,
-    table_name: []const u8,
-    num_rows: u64,
-    columns: []const block_mod.InsertColumn,
-    query_allocator: std.mem.Allocator,
-    cancel: ?*const std.atomic.Value(bool),
-    opts: query_mod.QueryOptions,
-) QueryError!void {
-    try self.sendQuery(query_text, cancel, opts);
-    const negotiated = self.server_info.negotiated(protocol.CLIENT_REVISION);
+        query_text: []const u8,
+        table_name: []const u8,
+        num_rows: u64,
+        columns: []const block_mod.InsertColumn,
+        query_allocator: std.mem.Allocator,
+        cancel: ?*const std.atomic.Value(bool),
+        opts: query_mod.QueryOptions,
+    ) QueryError!void {
+        try self.sendQuery(query_text, cancel, opts);
+        const negotiated = self.server_info.negotiated(protocol.CLIENT_REVISION);
+        const effective_compression: protocol.CompressionEnabled = if (opts.compression == .Enable or self.compression == .Enable) .Enable else .Disable;
+        const log_pe_compression: protocol.CompressionEnabled = if (effective_compression == .Enable and negotiated >= protocol.Revision.WITH_COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS) .Enable else .Disable;
 
-    // Drain the server's pre-data packets — at minimum the schema block
-    // (Data with 0 rows). Server may also interleave Progress / Log /
-    // ProfileEvents before signalling readiness for our data.
-    var schema_seen = false;
-    while (!schema_seen) {
-        const pkt = wire.readServerPacketId(self.transport.reader()) catch |e| {
+        // Drain the server's pre-data packets — at minimum the schema block
+        // (Data with 0 rows). Server may also interleave Progress / Log /
+        // ProfileEvents before signalling readiness for our data.
+        // Data/Totals/Extremes ride compressed when compression is on;
+        // Log/ProfileEvents are revision-gated (see protocol.zig).
+        var schema_seen = false;
+        while (!schema_seen) {
+            const pkt = wire.readServerPacketId(self.transport.reader()) catch |e| {
+                self.is_broken = true;
+                self.state = .broken;
+                return mapReadErrQuery(e);
+            };
+            switch (pkt) {
+                .Data => {
+                    // Discard the schema block — we trust the user's column
+                    // types match. A future hardening pass could validate here.
+                    const tn = wire.readStringOwned(self.transport.reader(), query_allocator, wire.MAX_DEFAULT_STRING) catch |e| {
+                        self.is_broken = true;
+                        self.state = .broken;
+                        return mapReadErrQuery(e);
+                    };
+                    const block = block_mod.readMaybeCompressed(self.transport.reader(), query_allocator, negotiated, tn, effective_compression) catch |e| {
+                        self.is_broken = true;
+                        self.state = .broken;
+                        return mapReadErrQuery(e);
+                    };
+                    block.deinit();
+                    schema_seen = true;
+                },
+                .Exception => {
+                    const exc = @import("exception.zig").readException(self.transport.reader(), query_allocator) catch |e| {
+                        self.is_broken = true;
+                        self.state = .broken;
+                        return mapReadErrQuery(e);
+                    };
+                    exc.deinit();
+                    self.is_broken = true;
+                    self.state = .broken;
+                    return error.ProtocolError;
+                },
+                .Totals, .Extremes => {
+                    const tn = wire.readStringOwned(self.transport.reader(), query_allocator, wire.MAX_DEFAULT_STRING) catch |e| {
+                        self.is_broken = true;
+                        self.state = .broken;
+                        return mapReadErrQuery(e);
+                    };
+                    const blk = block_mod.readMaybeCompressed(self.transport.reader(), query_allocator, negotiated, tn, effective_compression) catch |e| {
+                        self.is_broken = true;
+                        self.state = .broken;
+                        return mapReadErrQuery(e);
+                    };
+                    blk.deinit();
+                },
+                .Log, .ProfileEvents => {
+                    const tn = wire.readStringOwned(self.transport.reader(), query_allocator, wire.MAX_DEFAULT_STRING) catch |e| {
+                        self.is_broken = true;
+                        self.state = .broken;
+                        return mapReadErrQuery(e);
+                    };
+                    const blk = block_mod.readMaybeCompressed(self.transport.reader(), query_allocator, negotiated, tn, log_pe_compression) catch |e| {
+                        self.is_broken = true;
+                        self.state = .broken;
+                        return mapReadErrQuery(e);
+                    };
+                    blk.deinit();
+                },
+                .Progress => {
+                    _ = result_stream_mod.ResultStream.readProgressBody(self.transport.reader(), negotiated) catch |e| {
+                        self.is_broken = true;
+                        self.state = .broken;
+                        return mapReadErrQuery(e);
+                    };
+                },
+                .ProfileInfo => {
+                    _ = result_stream_mod.ResultStream.readProfileInfoBody(self.transport.reader()) catch |e| {
+                        self.is_broken = true;
+                        self.state = .broken;
+                        return mapReadErrQuery(e);
+                    };
+                },
+                .TableColumns => {
+                    const tc = result_stream_mod.ResultStream.readTableColumnsBody(self.transport.reader(), query_allocator) catch |e| {
+                        self.is_broken = true;
+                        self.state = .broken;
+                        return mapReadErrQuery(e);
+                    };
+                    tc.deinit(query_allocator);
+                },
+                else => {
+                    self.is_broken = true;
+                    self.state = .broken;
+                    return error.ProtocolError;
+                },
+            }
+        }
+
+        // Write our data block: packet_id (uncompressed) + table_name
+        // (uncompressed) + body (optionally LZ4-framed). Mirrors
+        // upstream Connection::sendData where `name` goes to raw out and
+        // only the block body is wrapped in `maybe_compressed_out`.
+        wire.writeClientPacketId(self.transport.writer(), .Data) catch |e| {
             self.is_broken = true;
             self.state = .broken;
-            return mapReadErrQuery(e);
+            return mapWriteErrQuery(e);
         };
-        switch (pkt) {
-            .Data => {
-                // Discard the schema block — we trust the user's column
-                // types match. A future hardening pass could validate here.
-                const block = block_mod.readBlock(self.transport.reader(), query_allocator, negotiated) catch |e| {
-                    self.is_broken = true;
-                    self.state = .broken;
-                    return mapReadErrQuery(e);
-                };
-                block.deinit();
-                schema_seen = true;
+        wire.writeStringBinary(self.transport.writer(), table_name) catch |e| {
+            self.is_broken = true;
+            self.state = .broken;
+            return mapWriteErrQuery(e);
+        };
+        var body_buf: std.Io.Writer.Allocating = .init(query_allocator);
+        defer body_buf.deinit();
+        block_mod.writeBlockBody(&body_buf.writer, .{}, num_rows, columns, negotiated) catch |e| {
+            self.is_broken = true;
+            self.state = .broken;
+            return mapWriteErrQuery(e);
+        };
+        compression_mod.writeMaybeCompressed(self.transport.writer(), query_allocator, body_buf.written(), effective_compression) catch |e| {
+            self.is_broken = true;
+            self.state = .broken;
+            return mapWriteErrQuery(e);
+        };
+
+        // Empty terminator: header + body via the same helpers.
+        query_mod.writeDataPacketHeader(self.transport.writer(), "") catch |e| {
+            self.is_broken = true;
+            self.state = .broken;
+            return mapWriteErrQuery(e);
+        };
+        var term_buf: std.Io.Writer.Allocating = .init(query_allocator);
+        defer term_buf.deinit();
+        query_mod.writeEmptyBlockBody(&term_buf.writer, negotiated) catch |e| {
+            self.is_broken = true;
+            self.state = .broken;
+            return mapWriteErrQuery(e);
+        };
+        compression_mod.writeMaybeCompressed(self.transport.writer(), query_allocator, term_buf.written(), effective_compression) catch |e| {
+            self.is_broken = true;
+            self.state = .broken;
+            return mapWriteErrQuery(e);
+        };
+        self.transport.writer().flush() catch |e| {
+            self.is_broken = true;
+            self.state = .broken;
+            return mapWriteErrQuery(e);
+        };
+
+        // Drain server response through EndOfStream via a temporary stream.
+        // Set `compression` so Data/Totals/Extremes (and gated
+        // Log/ProfileEvents) decode their compressed bodies correctly.
+        var stream: result_stream_mod.ResultStream = .{
+            .reader = self.transport.reader(),
+            .allocator = query_allocator,
+            .server_revision = negotiated,
+            .compression = effective_compression,
+            .client_state = .{
+                .state = self,
+                .is_broken = &self.is_broken,
+                .set_ready = setReadyImpl,
+                .set_broken = setBrokenImpl,
             },
-            .Exception => {
-                const exc = @import("exception.zig").readException(self.transport.reader(), query_allocator) catch |e| {
-                    self.is_broken = true;
-                    self.state = .broken;
-                    return mapReadErrQuery(e);
-                };
-                exc.deinit();
-                self.is_broken = true;
-                self.state = .broken;
+        };
+        while (try mapStreamErr(stream.next())) |packet| switch (packet) {
+            .end_of_stream => break,
+            .exception => |e| {
+                e.deinit();
                 return error.ProtocolError;
             },
-            // Server may interleave Log entries (block-shaped) and
-            // Progress packets before sending the schema Data block.
-            // Drain by reading their bodies and discarding.
-            .Log, .ProfileEvents, .Totals, .Extremes => {
-                const blk = block_mod.readBlock(self.transport.reader(), query_allocator, negotiated) catch |e| {
-                    self.is_broken = true;
-                    self.state = .broken;
-                    return mapReadErrQuery(e);
-                };
-                blk.deinit();
-            },
-            .Progress => {
-                _ = result_stream_mod.ResultStream.readProgressBody(self.transport.reader(), negotiated) catch |e| {
-                    self.is_broken = true;
-                    self.state = .broken;
-                    return mapReadErrQuery(e);
-                };
-            },
-            .ProfileInfo => {
-                _ = result_stream_mod.ResultStream.readProfileInfoBody(self.transport.reader()) catch |e| {
-                    self.is_broken = true;
-                    self.state = .broken;
-                    return mapReadErrQuery(e);
-                };
-            },
-            .TableColumns => {
-                const tc = result_stream_mod.ResultStream.readTableColumnsBody(self.transport.reader(), query_allocator) catch |e| {
-                    self.is_broken = true;
-                    self.state = .broken;
-                    return mapReadErrQuery(e);
-                };
-                tc.deinit(query_allocator);
-            },
-            else => {
-                self.is_broken = true;
-                self.state = .broken;
-                return error.ProtocolError;
-            },
-        }
-    }
-
-    // Write our data block. The packet ID prefix is required — without
-    // it the server reads the first body byte as a packet ID and bails
-    // ("Unexpected packet Hello received from client" if table_name=0-len).
-    wire.writeClientPacketId(self.transport.writer(), .Data) catch |e| {
-        self.is_broken = true;
-        self.state = .broken;
-        return mapWriteErrQuery(e);
-    };
-    block_mod.writeBlock(self.transport.writer(), table_name, .{}, num_rows, columns, negotiated) catch |e| {
-        self.is_broken = true;
-        self.state = .broken;
-        return mapWriteErrQuery(e);
-    };
-    // Empty terminator block signals end-of-INSERT to the server.
-    query_mod.writeEmptyDataTerminator(self.transport.writer(), negotiated) catch |e| {
-        self.is_broken = true;
-        self.state = .broken;
-        return mapWriteErrQuery(e);
-    };
-    self.transport.writer().flush() catch |e| {
-        self.is_broken = true;
-        self.state = .broken;
-        return mapWriteErrQuery(e);
-    };
-
-    // Drain server response through EndOfStream via a temporary stream.
-    var stream: result_stream_mod.ResultStream = .{
-        .reader = self.transport.reader(),
-        .allocator = query_allocator,
-        .server_revision = negotiated,
-        .client_state = .{
-            .state = self,
-            .is_broken = &self.is_broken,
-            .set_ready = setReadyImpl,
-            .set_broken = setBrokenImpl,
-        },
-    };
-    while (try mapStreamErr(stream.next())) |packet| switch (packet) {
-        .end_of_stream => break,
-        .exception => |e| {
-            e.deinit();
-            return error.ProtocolError;
-        },
-        .data, .totals, .extremes, .log, .profile_events => |b| b.deinit(),
-        .table_columns => |t| t.deinit(query_allocator),
-        .progress, .profile_info => {},
-    };
+            .data, .totals, .extremes, .log, .profile_events => |b| b.deinit(),
+            .table_columns => |t| t.deinit(query_allocator),
+            .progress, .profile_info => {},
+        };
     }
 };
 

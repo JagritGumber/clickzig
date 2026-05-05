@@ -113,30 +113,46 @@ pub fn readFrame(
 /// Write `data` as an LZ4 compression frame to `writer`. Uses the
 /// literal-only encoder (no compression). Server accepts and decodes
 /// it identically to a "real" LZ4-compressed frame.
+///
+/// Allocates a single buffer sized for the full hash input
+/// (method + sizes + literal-encoded payload) and encodes the LZ4
+/// payload directly into its tail — `enc` and `hash_buf[9..]` would be
+/// byte-identical post-encode, so collapsing to one allocation halves
+/// peak memory per frame.
 pub fn writeFrameLz4(
     writer: *std.Io.Writer,
     allocator: std.mem.Allocator,
     data: []const u8,
 ) Error!void {
-    const enc_size = lz4.worstCaseLiteralEncodedSize(data.len);
-    const enc = try allocator.alloc(u8, enc_size);
-    defer allocator.free(enc);
-    const enc_len = try lz4.encodeLiteralBlock(data, enc);
+    const enc_capacity = lz4.worstCaseLiteralEncodedSize(data.len);
+    var hash_buf = try allocator.alloc(u8, HEADER_TAIL_BYTES + enc_capacity);
+    defer allocator.free(hash_buf);
+    const enc_len = try lz4.encodeLiteralBlock(data, hash_buf[HEADER_TAIL_BYTES..]);
 
-    // Build the hash buffer = method + sizes + payload.
     const compressed_size: u32 = @intCast(HEADER_TAIL_BYTES + enc_len);
     const decompressed_size: u32 = @intCast(data.len);
-    var hash_buf = try allocator.alloc(u8, HEADER_TAIL_BYTES + enc_len);
-    defer allocator.free(hash_buf);
     hash_buf[0] = @intFromEnum(Method.lz4);
     std.mem.writeInt(u32, hash_buf[1..5], compressed_size, .little);
     std.mem.writeInt(u32, hash_buf[5..9], decompressed_size, .little);
-    @memcpy(hash_buf[9..], enc[0..enc_len]);
-    const sum = cityhash.cityhash128(hash_buf);
+    const used = hash_buf[0 .. HEADER_TAIL_BYTES + enc_len];
+    const sum = cityhash.cityhash128(used);
 
     try writer.writeInt(u64, sum.low, .little);
     try writer.writeInt(u64, sum.high, .little);
-    try writer.writeAll(hash_buf);
+    try writer.writeAll(used);
+}
+
+/// Write `body` to `writer`, optionally framed as an LZ4 compression
+/// frame. When `mode == .Disable`, passes bytes through verbatim
+/// (no allocation). When `.Enable`, wraps via `writeFrameLz4`.
+pub fn writeMaybeCompressed(
+    writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    mode: protocol.CompressionEnabled,
+) Error!void {
+    if (mode == .Enable) try writeFrameLz4(writer, allocator, body)
+    else try writer.writeAll(body);
 }
 
 const testing = std.testing;

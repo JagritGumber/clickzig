@@ -161,43 +161,15 @@ pub const ResultStream = struct {
     }
 
     fn readBlockAndCheck(self: *ResultStream, compressed_body: bool) !block_mod.Block {
-        if (compressed_body) {
-            // Symmetrical to the write side: `table_name` rides UNCOMPRESSED
-            // before the frame on the wire (matches upstream Connection::sendData
-            // which writes `name` to the raw stream and only the block body
-            // through `maybe_compressed_out`). Read it from the outer reader
-            // first, then read the frame, then parse the body from the
-            // decompressed bytes — passing `table_name` in so `readBlockBody`
-            // takes ownership.
-            const table_name = wire.readStringOwned(self.reader, self.allocator, wire.MAX_DEFAULT_STRING) catch |e| {
-                self.markBroken();
-                return e;
-            };
-            // Past this point ownership of `table_name` belongs to readBlockBody
-            // (which has its own errdefer on it). Don't add another guard here.
-            const frame = compression_mod.readFrame(self.reader, self.allocator) catch |e| {
-                self.allocator.free(table_name);
-                self.markBroken();
-                return e;
-            };
-            defer self.allocator.free(frame);
-            var fr: std.Io.Reader = .fixed(frame);
-            const block = block_mod.readBlockBody(&fr, self.allocator, self.server_revision, table_name) catch |e| {
-                self.markBroken();
-                return e;
-            };
-            // Frame must be consumed exactly — leftover bytes signal a
-            // row-data-sizing bug inside the column decoder, not a framing
-            // bug. Surface it loudly rather than silently misalign the next
-            // packet's read.
-            if (fr.buffered().len != 0) {
-                block.deinit();
-                self.markBroken();
-                return error.UnexpectedPacket;
-            }
-            return block;
-        }
-        return block_mod.readBlock(self.reader, self.allocator, self.server_revision) catch |e| {
+        const mode: protocol.CompressionEnabled = if (compressed_body) .Enable else .Disable;
+        // `table_name` rides UNCOMPRESSED on the wire (mirrors upstream
+        // Connection::sendData); read it here from the outer reader and
+        // hand ownership to `block.readMaybeCompressed`.
+        const table_name = wire.readStringOwned(self.reader, self.allocator, wire.MAX_DEFAULT_STRING) catch |e| {
+            self.markBroken();
+            return e;
+        };
+        return block_mod.readMaybeCompressed(self.reader, self.allocator, self.server_revision, table_name, mode) catch |e| {
             self.markBroken();
             return e;
         };

@@ -83,3 +83,5 @@ jobs:
         run: zig build smoke -- tuple-map
       - name: smoke compression
         run: zig build smoke -- compression
+      - name: smoke insert-compression
+        run: zig build smoke -- insert-compression

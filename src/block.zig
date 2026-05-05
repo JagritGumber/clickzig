@@ -26,6 +26,7 @@ const protocol = @import("protocol.zig");
 const wire = @import("wire.zig");
 const varint = @import("varint.zig");
 const column_mod = @import("column.zig");
+const compression_mod = @import("compression.zig");
 
 pub const BlockInfo = struct {
     is_overflows: bool = false,
@@ -85,9 +86,9 @@ pub const InsertColumn = struct {
 };
 
 /// Write a fully-populated Block (table_name + BlockInfo + columns).
-/// Symmetric to `readBlock`. Used by the INSERT path; the SELECT-side
-/// `writeEmptyDataTerminator` in query.zig is the zero-column variant
-/// of this for terminating SELECTs.
+/// Symmetric to `readBlock`. Thin wrapper kept for round-trip-test
+/// symmetry; the INSERT path uses `writeBlockBody` directly so it can
+/// keep `table_name` outside the optional compression frame.
 pub fn writeBlock(
     writer: *std.Io.Writer,
     table_name: []const u8,
@@ -97,6 +98,21 @@ pub fn writeBlock(
     server_revision: u64,
 ) std.Io.Writer.Error!void {
     try wire.writeStringBinary(writer, table_name);
+    try writeBlockBody(writer, info, num_rows, columns, server_revision);
+}
+
+/// Write the post-`table_name` portion of a Block (BlockInfo + counts +
+/// per-column). Symmetric to `readBlockBody`. Used by the compressed
+/// INSERT write path: `table_name` rides UNCOMPRESSED on the wire (per
+/// upstream `Connection::sendData`), only this body is wrapped in the
+/// compression frame.
+pub fn writeBlockBody(
+    writer: *std.Io.Writer,
+    info: BlockInfo,
+    num_rows: u64,
+    columns: []const InsertColumn,
+    server_revision: u64,
+) std.Io.Writer.Error!void {
     if (server_revision >= protocol.Revision.WITH_BLOCK_INFO) {
         // Field 1: u8 is_overflows
         try varint.writeVarUInt(writer, 1);
@@ -193,6 +209,38 @@ pub fn readBlockBody(
     };
 }
 
+/// Read a Block body, optionally framed in an LZ4 compression frame.
+/// Caller has already pulled `table_name` from the OUTER (uncompressed)
+/// reader; ownership transfers in here. When `mode == .Enable`, reads
+/// an LZ4 frame from `reader` and parses the body from the decompressed
+/// bytes — asserting the frame is consumed exactly. When `.Disable`,
+/// parses directly from `reader`. Surfaces frame-residue as
+/// `error.UnexpectedPacket` so a future column-decoder sizing bug can't
+/// silently misalign the next packet.
+pub fn readMaybeCompressed(
+    reader: *std.Io.Reader,
+    allocator: std.mem.Allocator,
+    server_revision: u64,
+    table_name: []const u8,
+    mode: protocol.CompressionEnabled,
+) !Block {
+    if (mode == .Enable) {
+        const frame = compression_mod.readFrame(reader, allocator) catch |e| {
+            allocator.free(table_name);
+            return e;
+        };
+        defer allocator.free(frame);
+        var fr: std.Io.Reader = .fixed(frame);
+        const blk = try readBlockBody(&fr, allocator, server_revision, table_name);
+        if (fr.buffered().len != 0) {
+            blk.deinit();
+            return error.UnexpectedPacket;
+        }
+        return blk;
+    }
+    return readBlockBody(reader, allocator, server_revision, table_name);
+}
+
 const testing = std.testing;
 
 test "readBlock decodes a single-column UInt8 block at pinned revision" {
@@ -277,4 +325,24 @@ test "readBlock rejects custom_serialization byte != 0" {
 
     var r: std.Io.Reader = .fixed(w.buffered());
     try testing.expectError(error.CustomSerializationUnsupported, readBlock(&r, testing.allocator, protocol.CLIENT_REVISION));
+}
+
+test "writeBlockBody does not emit table_name" {
+    // Lock the contract that `writeBlockBody` writes ONLY the BlockInfo +
+    // counts + per-column bytes, NOT the leading `table_name`. The
+    // INSERT compression path puts table_name OUTSIDE the LZ4 frame and
+    // wraps only the body — if a future refactor re-includes table_name
+    // here, the SELECT round-trip test still passes (writeBlock prepends
+    // table_name) but every compressed INSERT silently breaks because
+    // the server reads two table_names: one uncompressed before the
+    // frame, one inside.
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const cols: [0]InsertColumn = .{};
+    try writeBlockBody(&w, .{}, 0, &cols, protocol.CLIENT_REVISION);
+    const out = w.buffered();
+    // First byte must be the BlockInfo varint `1` (the is_overflows tag),
+    // NOT a length-prefixed table_name string. Empty table_name would
+    // emit a single 0 byte; non-empty would emit varint(len) + bytes.
+    try testing.expectEqual(@as(u8, 1), out[0]);
 }

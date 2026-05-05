@@ -51,8 +51,10 @@ pub fn main(init: std.process.Init) !void {
         try runTupleMap(allocator, io);
     } else if (std.mem.eql(u8, scenario, "compression")) {
         try runCompression(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "insert-compression")) {
+        try runInsertCompression(allocator, io);
     } else {
-        std.debug.print("usage: smoke_connect [happy|ping|wrong-pass|unreachable|wrong-host|query-bytes]\n", .{});
+        std.debug.print("usage: smoke_connect [happy|ping|wrong-pass|unreachable|wrong-host|query-bytes|query-mixed|insert-roundtrip|nullable-roundtrip|complex-types|pool|dsn|decimal-ip|tuple-map|compression|insert-compression]\n", .{});
         return error.UnknownScenario;
     }
 }
@@ -291,6 +293,93 @@ fn runNullableRoundtrip(allocator: std.mem.Allocator, io: std.Io) !void {
     };
     if (rows_seen != 5) return error.UnexpectedRowCount;
     std.debug.print("[nullable] OK: 5 rows with mixed null/non-null\n", .{});
+}
+
+fn runInsertCompression(allocator: std.mem.Allocator, io: std.Io) !void {
+    // Identical to runInsertRoundtrip but with compression enabled
+    // end-to-end: Hello negotiates compression via per-query flag,
+    // INSERT data block + terminator ride wrapped LZ4 frames, server's
+    // schema-block schema response and post-write drain are read back
+    // through the compressed path. 100 rows is the smallest size that
+    // reliably exercises the compressed read path with a non-trivial
+    // body, surfaces a Progress packet during drain, and gives the
+    // assertion teeth.
+    var cfg = baseConfig(allocator);
+    cfg.compression = .Enable;
+    const client = try clickzig.Client.connectTcp(cfg, io, null, null);
+    defer client.close();
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    // Belt-and-suspenders: client default is Enable AND every per-query
+    // opts.compression is Enable. Either gate alone would flip
+    // effective_compression to .Enable; setting both makes the smoke's
+    // intent obvious and surfaces a regression if either gate stops
+    // working independently.
+    const compressed_opts: clickzig.query.QueryOptions = .{ .compression = .Enable };
+
+    {
+        var s = try client.query("DROP TABLE IF EXISTS smoke_insert_compression", arena.allocator(), null, compressed_opts);
+        while (try s.next()) |p| switch (p) {
+            .end_of_stream => break,
+            .exception => |e| { std.debug.print("[insert-compression] drop failed: {s}\n", .{e.message}); return error.SetupFailed; },
+            else => {},
+        };
+    }
+    {
+        var s = try client.query("CREATE TABLE smoke_insert_compression (id UInt32, label String) ENGINE = Memory", arena.allocator(), null, compressed_opts);
+        while (try s.next()) |p| switch (p) {
+            .end_of_stream => break,
+            .exception => |e| { std.debug.print("[insert-compression] create failed: {s}\n", .{e.message}); return error.SetupFailed; },
+            else => {},
+        };
+    }
+
+    var ids: [100]u32 = undefined;
+    var labels_storage: [100][16]u8 = undefined;
+    var labels: [100][]u8 = undefined;
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        ids[i] = @intCast(i);
+        labels[i] = std.fmt.bufPrint(&labels_storage[i], "row-{d}", .{i}) catch unreachable;
+    }
+    const cols = [_]clickzig.block.InsertColumn{
+        .{ .name = "id", .type_name = "UInt32", .data = .{ .UInt32 = &ids } },
+        .{ .name = "label", .type_name = "String", .data = .{ .String = &labels } },
+    };
+    try client.insert(
+        "INSERT INTO smoke_insert_compression (id, label) FORMAT Native",
+        "",
+        100,
+        &cols,
+        arena.allocator(),
+        null,
+        compressed_opts,
+    );
+    std.debug.print("[insert-compression] inserted 100 rows via LZ4 frames\n", .{});
+
+    var s = try client.query("SELECT id, label FROM smoke_insert_compression ORDER BY id", arena.allocator(), null, compressed_opts);
+    var rows_seen: u32 = 0;
+    while (try s.next()) |p| switch (p) {
+        .data => |b| {
+            if (b.num_rows == 0) continue;
+            const ids_back = b.columns[0].column.UInt32;
+            const labels_back = b.columns[1].column.String;
+            var j: usize = 0;
+            while (j < b.num_rows) : (j += 1) {
+                if (ids_back[j] != ids[rows_seen + j]) return error.InsertMismatch;
+                if (!std.mem.eql(u8, labels_back[j], labels[rows_seen + j])) return error.InsertMismatch;
+            }
+            rows_seen += @intCast(b.num_rows);
+        },
+        .end_of_stream => break,
+        .exception => |e| { std.debug.print("[insert-compression] select failed: {s}\n", .{e.message}); return error.QueryFailed; },
+        else => {},
+    };
+    if (rows_seen != 100) {
+        std.debug.print("[insert-compression] FAIL: expected 100 rows, got {d}\n", .{rows_seen});
+        return error.UnexpectedRowCount;
+    }
+    std.debug.print("[insert-compression] OK: 100 rows round-tripped via LZ4 frames\n", .{});
 }
 
 fn runInsertRoundtrip(allocator: std.mem.Allocator, io: std.Io) !void {
