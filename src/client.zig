@@ -630,7 +630,7 @@ pub const Client = struct {
         };
         var body_buf: std.Io.Writer.Allocating = .init(query_allocator);
         defer body_buf.deinit();
-        block_mod.writeBlockBody(&body_buf.writer, .{}, num_rows, columns, negotiated) catch |e| {
+        block_mod.writeBlockBody(&body_buf.writer, query_allocator, .{}, num_rows, columns, negotiated) catch |e| {
             self.is_broken = true;
             self.state = .broken;
             return mapWriteErrQuery(e);

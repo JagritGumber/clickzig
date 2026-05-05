@@ -91,14 +91,15 @@ pub const InsertColumn = struct {
 /// keep `table_name` outside the optional compression frame.
 pub fn writeBlock(
     writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
     table_name: []const u8,
     info: BlockInfo,
     num_rows: u64,
     columns: []const InsertColumn,
     server_revision: u64,
-) std.Io.Writer.Error!void {
+) !void {
     try wire.writeStringBinary(writer, table_name);
-    try writeBlockBody(writer, info, num_rows, columns, server_revision);
+    try writeBlockBody(writer, allocator, info, num_rows, columns, server_revision);
 }
 
 /// Write the post-`table_name` portion of a Block (BlockInfo + counts +
@@ -106,13 +107,18 @@ pub fn writeBlock(
 /// INSERT write path: `table_name` rides UNCOMPRESSED on the wire (per
 /// upstream `Connection::sendData`), only this body is wrapped in the
 /// compression frame.
+///
+/// `allocator` is used as scratch memory for type-driven encoders that
+/// need to build derived state (currently LowCardinality dict + indexes).
+/// Pass the per-query arena so encoder allocations free in O(1).
 pub fn writeBlockBody(
     writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
     info: BlockInfo,
     num_rows: u64,
     columns: []const InsertColumn,
     server_revision: u64,
-) std.Io.Writer.Error!void {
+) !void {
     if (server_revision >= protocol.Revision.WITH_BLOCK_INFO) {
         // Field 1: u8 is_overflows
         try varint.writeVarUInt(writer, 1);
@@ -131,7 +137,7 @@ pub fn writeBlockBody(
         if (server_revision >= protocol.Revision.WITH_CUSTOM_SERIALIZATION) {
             try writer.writeByte(0); // we never emit custom-serialization columns
         }
-        try column_mod.writeColumn(writer, col.data);
+        try column_mod.writeColumnTyped(writer, allocator, col.type_name, col.data, num_rows);
     }
 }
 
@@ -301,7 +307,7 @@ test "writeBlock + readBlock round-trip a 2-col 3-row block" {
         .{ .name = "id", .type_name = "UInt32", .data = .{ .UInt32 = &ids } },
         .{ .name = "label", .type_name = "String", .data = .{ .String = &names } },
     };
-    try writeBlock(&w, "", .{}, 3, &cols, protocol.CLIENT_REVISION);
+    try writeBlock(&w, ally, "", .{}, 3, &cols, protocol.CLIENT_REVISION);
 
     var r: std.Io.Reader = .fixed(w.buffered());
     const block = try readBlock(&r, ally, protocol.CLIENT_REVISION);
@@ -339,7 +345,7 @@ test "writeBlockBody does not emit table_name" {
     var buf: [128]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     const cols: [0]InsertColumn = .{};
-    try writeBlockBody(&w, .{}, 0, &cols, protocol.CLIENT_REVISION);
+    try writeBlockBody(&w, testing.allocator, .{}, 0, &cols, protocol.CLIENT_REVISION);
     const out = w.buffered();
     // First byte must be the BlockInfo varint `1` (the is_overflows tag),
     // NOT a length-prefixed table_name string. Empty table_name would

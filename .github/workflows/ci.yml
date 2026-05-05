@@ -87,3 +87,5 @@ jobs:
         run: zig build smoke -- insert-compression
       - name: smoke lowcardinality
         run: zig build smoke -- lowcardinality
+      - name: smoke lc-write
+        run: zig build smoke -- lc-write

@@ -27,7 +27,7 @@ clickzig speaks the ClickHouse native TCP protocol (port 9000 / 9440 TLS) direct
 - Composite: Nullable(T), Array(T), FixedString(N), UUID, Tuple(...), Map(K, V)
 - Aliases: Date, Date32, DateTime, DateTime64, Enum8, Enum16, IPv4, IPv6
 - Decimal(P, S) → Int32/Int64/Int128/Int256 based on precision (Decimal32/64/128/256 explicit aliases too)
-- LowCardinality(T) and LowCardinality(Nullable(T)) (read-side, materialized to T)
+- LowCardinality(T) and LowCardinality(Nullable(T)) — read materializes to T; INSERT encodes a per-block dictionary on the fly (numeric, String, FixedString inner)
 
 **Compression**
 - LZ4 frames on both SELECT and INSERT (CityHash 1.0.2 frame checksum, vendored encoder + decoder)
@@ -42,7 +42,6 @@ clickzig speaks the ClickHouse native TCP protocol (port 9000 / 9440 TLS) direct
 
 ## known gaps before v0.16.0
 
-- **LowCardinality writes** — encoded only on the read side. Insert into LC columns by going through `INSERT ... SELECT` or by materializing via the inner type (server side adapts).
 - **Sparse / Dynamic / JSON** — surface as `error.UnsupportedColumnType`. Decoders need polymorphic-variant support that doesn't fit the v0.16.0 column union; deferred.
 - **Async via `std.Io` fibers** — current API is sync. Iterator-first stream contract is locked so the column-store decoder doesn't fight the API later.
 - **Parameterised queries** — bindings via `?`/`{name:Type}` placeholders not yet implemented; all queries are raw text + Native blocks for INSERT data.
@@ -205,7 +204,7 @@ zig build test
 zig build smoke -- <scenario>
 ```
 
-Scenarios: `happy`, `ping`, `wrong-pass`, `unreachable`, `wrong-host`, `query-bytes`, `query-mixed`, `insert-roundtrip`, `nullable-roundtrip`, `complex-types`, `tuple-map`, `decimal-ip`, `pool`, `dsn`, `compression`, `insert-compression`, `lowcardinality`.
+Scenarios: `happy`, `ping`, `wrong-pass`, `unreachable`, `wrong-host`, `query-bytes`, `query-mixed`, `insert-roundtrip`, `nullable-roundtrip`, `complex-types`, `tuple-map`, `decimal-ip`, `pool`, `dsn`, `compression`, `insert-compression`, `lowcardinality`, `lc-write`.
 
 The smoke harness assumes `clickhouse/clickhouse-server:26.3` running locally with `default:test` credentials. CI runs every scenario against a service container on every push.
 

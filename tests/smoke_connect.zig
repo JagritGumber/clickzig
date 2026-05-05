@@ -55,10 +55,117 @@ pub fn main(init: std.process.Init) !void {
         try runInsertCompression(allocator, io);
     } else if (std.mem.eql(u8, scenario, "lowcardinality")) {
         try runLowCardinality(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "lc-write")) {
+        try runLowCardinalityWrite(allocator, io);
     } else {
-        std.debug.print("usage: smoke_connect [happy|ping|wrong-pass|unreachable|wrong-host|query-bytes|query-mixed|insert-roundtrip|nullable-roundtrip|complex-types|pool|dsn|decimal-ip|tuple-map|compression|insert-compression|lowcardinality]\n", .{});
+        std.debug.print("usage: smoke_connect [happy|ping|wrong-pass|unreachable|wrong-host|query-bytes|query-mixed|insert-roundtrip|nullable-roundtrip|complex-types|pool|dsn|decimal-ip|tuple-map|compression|insert-compression|lowcardinality|lc-write]\n", .{});
         return error.UnknownScenario;
     }
+}
+
+fn runLowCardinalityWrite(allocator: std.mem.Allocator, io: std.Io) !void {
+    // CREATE a Memory-engine table with LC(String) and LC(Nullable(UInt32)),
+    // INSERT through the client (which now encodes LC frames), SELECT
+    // back, and verify exact match. Round-trips both the read AND write
+    // sides of the LC implementation against a real server.
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    defer client.close();
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+
+    {
+        var s = try client.query("DROP TABLE IF EXISTS smoke_lc_w", arena.allocator(), null, .{});
+        while (try s.next()) |p| switch (p) {
+            .end_of_stream => break,
+            .exception => |e| { std.debug.print("[lc-write] drop failed: {s}\n", .{e.message}); return error.SetupFailed; },
+            else => {},
+        };
+    }
+    {
+        // ClickHouse rejects LowCardinality of numerics by default
+        // (allow_suspicious_low_cardinality_types). Use the canonical
+        // LC(String) and LC(Nullable(String)) shapes, which are the
+        // primary real-world use case anyway. Numeric LC encoding is
+        // covered by the unit tests in column.zig.
+        var s = try client.query(
+            \\CREATE TABLE smoke_lc_w (
+            \\    k UInt32,
+            \\    label LowCardinality(String),
+            \\    note LowCardinality(Nullable(String))
+            \\) ENGINE = Memory
+        , arena.allocator(), null, .{});
+        while (try s.next()) |p| switch (p) {
+            .end_of_stream => break,
+            .exception => |e| { std.debug.print("[lc-write] create failed: {s}\n", .{e.message}); return error.SetupFailed; },
+            else => {},
+        };
+    }
+
+    var ks = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    var labels = [_][]u8{
+        @constCast("hot"), @constCast("cold"), @constCast("hot"),
+        @constCast("cold"), @constCast("hot"), @constCast("hot"),
+    };
+    var note_mask = [_]u8{ 0, 1, 0, 0, 1, 0 };
+    var note_values = [_][]u8{
+        @constCast("primary"),
+        @constCast(""),
+        @constCast("backup"),
+        @constCast("primary"),
+        @constCast(""),
+        @constCast("backup"),
+    };
+    var note_nullable: clickzig.column.Nullable = .{
+        .mask = &note_mask,
+        .inner = .{ .String = &note_values },
+    };
+    const cols = [_]clickzig.block.InsertColumn{
+        .{ .name = "k", .type_name = "UInt32", .data = .{ .UInt32 = &ks } },
+        .{ .name = "label", .type_name = "LowCardinality(String)", .data = .{ .String = &labels } },
+        .{
+            .name = "note",
+            .type_name = "LowCardinality(Nullable(String))",
+            .data = .{ .Nullable = &note_nullable },
+        },
+    };
+    try client.insert(
+        "INSERT INTO smoke_lc_w (k, label, note) FORMAT Native",
+        "",
+        6,
+        &cols,
+        arena.allocator(),
+        null,
+        .{ .query_id = "smoke-lc-write" },
+    );
+    std.debug.print("[lc-write] inserted 6 rows via LC encoder\n", .{});
+
+    var s = try client.query("SELECT k, label, note FROM smoke_lc_w ORDER BY k", arena.allocator(), null, .{});
+    var seen: u32 = 0;
+    while (try s.next()) |p| switch (p) {
+        .data => |b| {
+            if (b.num_rows == 0) continue;
+            const ks_back = b.columns[0].column.UInt32;
+            const labels_back = b.columns[1].column.String;
+            const notes_back = b.columns[2].column.Nullable;
+            var i: usize = 0;
+            while (i < b.num_rows) : (i += 1) {
+                if (ks_back[i] != ks[seen + i]) return error.LcWriteMismatch;
+                if (!std.mem.eql(u8, labels_back[i], labels[seen + i])) return error.LcWriteMismatch;
+                if (notes_back.mask[i] != note_mask[seen + i]) return error.LcWriteMismatch;
+                if (note_mask[seen + i] == 0) {
+                    if (!std.mem.eql(u8, notes_back.inner.String[i], note_values[seen + i])) {
+                        return error.LcWriteMismatch;
+                    }
+                }
+            }
+            seen += @intCast(b.num_rows);
+        },
+        .end_of_stream => break,
+        .exception => |e| { std.debug.print("[lc-write] select failed: {s}\n", .{e.message}); return error.QueryFailed; },
+        else => {},
+    };
+    if (seen != 6) return error.UnexpectedRowCount;
+    std.debug.print("[lc-write] OK: 6 rows round-tripped through LC write encoder\n", .{});
 }
 
 fn runLowCardinality(allocator: std.mem.Allocator, io: std.Io) !void {
