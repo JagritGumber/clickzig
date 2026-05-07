@@ -2,9 +2,8 @@
 //!
 //! `Client` does NOT bind to `std.Io.net.Stream`. Instead it holds a
 //! `Transport` vtable which exposes a `*std.Io.Reader`, `*std.Io.Writer`,
-//! and `close()`. This lets a future caller swap in `Io.Uring`, a
-//! `Kqueue` backend, a unix-domain socket, or a fully synthetic mock
-//! without touching Client code.
+//! and `close()`. Alternate backends (Io.Uring, Kqueue, unix-domain
+//! sockets, or synthetic mocks) can slot in without touching Client code.
 //!
 //! `TcpTransport` is the canonical built-in: connect over TCP via
 //! `std.Io.net.IpAddress.connect` (IP literal) or
@@ -17,11 +16,13 @@
 //! `TcpTransport` itself is destroyed by the caller (or by Client when
 //! `transport_owned` is set).
 //!
-//! Note on timeouts: `setReadTimeout`/`setWriteTimeout` store the
-//! requested ms value but DO NOT enforce it at the OS level in
-//! v0.16.0-alpha. Per-operation timeouts via `std.Io.Timeout` land in
-//! v0.17 alongside the query path. Documented loudly so callers don't
-//! assume an OS-level guarantee.
+//! Timeout note: Zig 0.16's threaded TCP connect implementation still
+//! panics when std's per-connect timeout flag is used. TcpTransport
+//! therefore enforces dial timeout by racing the normal connect path
+//! against `Io.Timeout.sleep` and canceling the loser. Read/write
+//! timeouts race the socket operation against a timer and retain the
+//! underlying transport error so Client can map it to the public timeout
+//! variants.
 
 const std = @import("std");
 const Io = std.Io;
@@ -36,6 +37,8 @@ pub const Transport = struct {
         close: *const fn (ptr: *anyopaque) void,
         setReadTimeout: *const fn (ptr: *anyopaque, ms: ?u32) anyerror!void,
         setWriteTimeout: *const fn (ptr: *anyopaque, ms: ?u32) anyerror!void,
+        lastReadError: *const fn (ptr: *anyopaque) ?anyerror,
+        lastWriteError: *const fn (ptr: *anyopaque) ?anyerror,
     };
 
     pub fn reader(self: Transport) *Io.Reader {
@@ -52,6 +55,12 @@ pub const Transport = struct {
     }
     pub fn setWriteTimeout(self: Transport, ms: ?u32) !void {
         return self.vtable.setWriteTimeout(self.ptr, ms);
+    }
+    pub fn lastReadError(self: Transport) ?anyerror {
+        return self.vtable.lastReadError(self.ptr);
+    }
+    pub fn lastWriteError(self: Transport) ?anyerror {
+        return self.vtable.lastWriteError(self.ptr);
     }
 };
 
@@ -74,6 +83,7 @@ pub const ConnectError = error{
     ConnectionTimeout,
     NetworkUnreachable,
     OutOfMemory,
+    ConcurrencyUnavailable,
 } || Io.Cancelable;
 
 /// TCP-over-std.Io.net transport. Heap-allocated because `reader_state`
@@ -85,11 +95,12 @@ pub const TcpTransport = struct {
     stream: Io.net.Stream,
     read_buf: []u8,
     write_buf: []u8,
-    reader_state: Io.net.Stream.Reader,
-    writer_state: Io.net.Stream.Writer,
+    reader_state: TcpReader,
+    writer_state: TcpWriter,
     read_timeout_ms: ?u32 = null,
     write_timeout_ms: ?u32 = null,
-    closed: bool = false,
+    socket_closed: bool = false,
+    deinitialized: bool = false,
 
     /// Connect to `host:port`. `host` may be an IPv4/IPv6 literal or
     /// a DNS hostname. Returns a heap-allocated TcpTransport owned by
@@ -109,31 +120,7 @@ pub const TcpTransport = struct {
         const write_buf = allocator.alloc(u8, opts.write_buffer_size) catch return error.OutOfMemory;
         errdefer allocator.free(write_buf);
 
-        // std.Io.Threaded panics on both Windows (netConnectIpWindows) and
-        // POSIX (netConnectIpPosix) if options.timeout != .none — both have
-        // a `@panic("TODO implement ...")` guard as of Zig 0.16.0. We pass
-        // .none everywhere and rely on the OS TCP connect timeout. Per-call
-        // `dial_timeout_ms` enforcement lands in v0.17 alongside Io.Uring
-        // and the proper per-op timeout wiring.
-        _ = opts.dial_timeout_ms;
-        const timeout: Io.Timeout = .none;
-
-        const stream: Io.net.Stream = blk: {
-            // Try IP literal first (cheap, no DNS).
-            if (Io.net.IpAddress.parse(host, port)) |addr| {
-                break :blk Io.net.IpAddress.connect(&addr, io, .{
-                    .mode = .stream,
-                    .timeout = timeout,
-                }) catch |e| return mapConnectError(e);
-            } else |_| {
-                // Fall back to DNS.
-                const hn = Io.net.HostName.init(host) catch return error.InvalidHost;
-                break :blk Io.net.HostName.connect(hn, io, port, .{
-                    .mode = .stream,
-                    .timeout = timeout,
-                }) catch |e| return mapHostConnectError(e);
-            }
-        };
+        const stream = connectWithTimeout(io, host, port, opts.dial_timeout_ms) catch |e| return e;
         errdefer stream.close(io);
 
         self.* = .{
@@ -142,8 +129,8 @@ pub const TcpTransport = struct {
             .stream = stream,
             .read_buf = read_buf,
             .write_buf = write_buf,
-            .reader_state = .init(stream, io, read_buf),
-            .writer_state = .init(stream, io, write_buf),
+            .reader_state = .init(self, read_buf),
+            .writer_state = .init(self, write_buf),
         };
         return self;
     }
@@ -152,11 +139,17 @@ pub const TcpTransport = struct {
     /// responsible for `allocator.destroy(self)` afterward (or relies on
     /// the Client to do it when `transport_owned` is set).
     pub fn deinit(self: *TcpTransport) void {
-        if (self.closed) return;
-        self.closed = true;
-        self.stream.close(self.io);
+        if (self.deinitialized) return;
+        self.deinitialized = true;
+        self.closeSocket();
         self.allocator.free(self.read_buf);
         self.allocator.free(self.write_buf);
+    }
+
+    fn closeSocket(self: *TcpTransport) void {
+        if (self.socket_closed) return;
+        self.socket_closed = true;
+        self.stream.close(self.io);
     }
 
     pub fn transport(self: *TcpTransport) Transport {
@@ -169,6 +162,8 @@ pub const TcpTransport = struct {
         .close = closeImpl,
         .setReadTimeout = setReadTimeoutImpl,
         .setWriteTimeout = setWriteTimeoutImpl,
+        .lastReadError = lastReadErrorImpl,
+        .lastWriteError = lastWriteErrorImpl,
     };
 
     fn readerImpl(ptr: *anyopaque) *Io.Reader {
@@ -186,14 +181,333 @@ pub const TcpTransport = struct {
     fn setReadTimeoutImpl(ptr: *anyopaque, ms: ?u32) anyerror!void {
         const self: *TcpTransport = @ptrCast(@alignCast(ptr));
         self.read_timeout_ms = ms;
-        // OS-level enforcement deferred to v0.17 when per-op Io.Timeout
-        // is wired into the read/write paths. Storing for forward compat.
     }
     fn setWriteTimeoutImpl(ptr: *anyopaque, ms: ?u32) anyerror!void {
         const self: *TcpTransport = @ptrCast(@alignCast(ptr));
         self.write_timeout_ms = ms;
     }
+    fn lastReadErrorImpl(ptr: *anyopaque) ?anyerror {
+        const self: *TcpTransport = @ptrCast(@alignCast(ptr));
+        return self.reader_state.err;
+    }
+    fn lastWriteErrorImpl(ptr: *anyopaque) ?anyerror {
+        const self: *TcpTransport = @ptrCast(@alignCast(ptr));
+        return self.writer_state.err;
+    }
 };
+
+const max_iovecs_len = 8;
+
+fn timeoutFromMs(ms: u32) Io.Timeout {
+    return .{ .duration = .{
+        .raw = .fromMilliseconds(ms),
+        .clock = .awake,
+    } };
+}
+
+const TcpReader = struct {
+    parent: *TcpTransport,
+    interface: Io.Reader,
+    err: ?anyerror = null,
+
+    fn init(parent: *TcpTransport, buffer: []u8) TcpReader {
+        return .{
+            .parent = parent,
+            .interface = .{
+                .vtable = &.{
+                    .stream = streamImpl,
+                    .readVec = readVec,
+                },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn streamImpl(io_r: *Io.Reader, io_w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const dest = limit.slice(try io_w.writableSliceGreedy(1));
+        var data: [1][]u8 = .{dest};
+        const n = try readVec(io_r, &data);
+        io_w.advance(n);
+        return n;
+    }
+
+    fn readVec(io_r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+        const r: *TcpReader = @alignCast(@fieldParentPtr("interface", io_r));
+        r.err = null;
+
+        var iovecs_buffer: [max_iovecs_len][]u8 = undefined;
+        const dest_n, const data_size = try io_r.writableVector(&iovecs_buffer, data);
+        const dest = iovecs_buffer[0..dest_n];
+        std.debug.assert(dest[0].len > 0);
+
+        const n = if (r.parent.read_timeout_ms) |ms| blk: {
+            if (ms == 0) break :blk try r.readNoTimeout(dest);
+            break :blk try r.readWithTimeout(dest[0], ms);
+        } else try r.readNoTimeout(dest);
+
+        if (n == 0) return error.EndOfStream;
+        if (n > data_size) {
+            r.interface.end += n - data_size;
+            return data_size;
+        }
+        return n;
+    }
+
+    fn readNoTimeout(r: *TcpReader, dest: [][]u8) Io.Reader.Error!usize {
+        const parent = r.parent;
+        return parent.io.vtable.netRead(parent.io.userdata, parent.stream.socket.handle, dest) catch |err| {
+            r.err = err;
+            return error.ReadFailed;
+        };
+    }
+
+    fn readWithTimeout(r: *TcpReader, dest: []u8, ms: u32) Io.Reader.Error!usize {
+        const parent = r.parent;
+        var dests = [_][]u8{dest};
+        var queue_storage: [2]ReadResult = undefined;
+        var queue: Io.Queue(ReadResult) = .init(&queue_storage);
+        var group: Io.Group = .init;
+        defer group.cancel(parent.io);
+
+        group.concurrent(parent.io, readTask, .{ parent, &dests, &queue }) catch |err| {
+            r.err = err;
+            return error.ReadFailed;
+        };
+        group.concurrent(parent.io, readTimeoutTask, .{ parent.io, ms, &queue }) catch |err| {
+            r.err = err;
+            return error.ReadFailed;
+        };
+
+        const first = queue.getOne(parent.io) catch |err| {
+            r.err = err;
+            return error.ReadFailed;
+        };
+        switch (first) {
+            .read => |n| return n,
+            .failed => |err| {
+                r.err = err;
+                return error.ReadFailed;
+            },
+            .timed_out => {
+                r.err = error.Timeout;
+                return error.ReadFailed;
+            },
+        }
+    }
+};
+
+const ReadResult = union(enum) {
+    read: usize,
+    failed: anyerror,
+    timed_out,
+};
+
+fn readTask(parent: *TcpTransport, dest: [][]u8, queue: *Io.Queue(ReadResult)) Io.Cancelable!void {
+    const result: ReadResult = if (parent.io.vtable.netRead(parent.io.userdata, parent.stream.socket.handle, dest)) |n|
+        .{ .read = n }
+    else |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => .{ .failed = err },
+    };
+    queue.putOne(parent.io, result) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.Closed => {},
+    };
+}
+
+fn readTimeoutTask(io: Io, read_timeout_ms: u32, queue: *Io.Queue(ReadResult)) Io.Cancelable!void {
+    try Io.Timeout.sleep(timeoutFromMs(read_timeout_ms), io);
+    queue.putOne(io, .timed_out) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.Closed => {},
+    };
+}
+
+const WriteResult = union(enum) {
+    wrote: usize,
+    failed: anyerror,
+    timed_out,
+};
+
+const TcpWriter = struct {
+    parent: *TcpTransport,
+    interface: Io.Writer,
+    err: ?anyerror = null,
+
+    fn init(parent: *TcpTransport, buffer: []u8) TcpWriter {
+        return .{
+            .parent = parent,
+            .interface = .{
+                .vtable = &.{
+                    .drain = drain,
+                    .sendFile = sendFile,
+                },
+                .buffer = buffer,
+            },
+        };
+    }
+
+    fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const w: *TcpWriter = @alignCast(@fieldParentPtr("interface", io_w));
+        w.err = null;
+        const n = if (w.parent.write_timeout_ms) |ms| blk: {
+            if (ms == 0) break :blk try w.writeNoTimeout(io_w, data, splat);
+            break :blk try w.writeWithTimeout(io_w, data, splat, ms);
+        } else try w.writeNoTimeout(io_w, data, splat);
+        return io_w.consume(n);
+    }
+
+    fn writeNoTimeout(w: *TcpWriter, io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const parent = w.parent;
+        return parent.io.vtable.netWrite(parent.io.userdata, parent.stream.socket.handle, io_w.buffered(), data, splat) catch |err| {
+            w.err = err;
+            return error.WriteFailed;
+        };
+    }
+
+    fn writeWithTimeout(w: *TcpWriter, io_w: *Io.Writer, data: []const []const u8, splat: usize, ms: u32) Io.Writer.Error!usize {
+        const parent = w.parent;
+        var queue_storage: [2]WriteResult = undefined;
+        var queue: Io.Queue(WriteResult) = .init(&queue_storage);
+        var group: Io.Group = .init;
+        defer group.cancel(parent.io);
+
+        group.concurrent(parent.io, writeTask, .{ parent, io_w.buffered(), data, splat, &queue }) catch |err| {
+            w.err = err;
+            return error.WriteFailed;
+        };
+        group.concurrent(parent.io, writeTimeoutTask, .{ parent.io, ms, &queue }) catch |err| {
+            w.err = err;
+            return error.WriteFailed;
+        };
+
+        const first = queue.getOne(parent.io) catch |err| {
+            w.err = err;
+            return error.WriteFailed;
+        };
+        switch (first) {
+            .wrote => |n| return n,
+            .failed => |err| {
+                w.err = err;
+                return error.WriteFailed;
+            },
+            .timed_out => {
+                w.err = error.Timeout;
+                return error.WriteFailed;
+            },
+        }
+    }
+
+    fn sendFile(io_w: *Io.Writer, file_reader: *Io.File.Reader, limit: Io.Limit) Io.Writer.FileError!usize {
+        _ = io_w;
+        _ = file_reader;
+        _ = limit;
+        return error.Unimplemented;
+    }
+};
+
+fn writeTask(
+    parent: *TcpTransport,
+    header: []const u8,
+    data: []const []const u8,
+    splat: usize,
+    queue: *Io.Queue(WriteResult),
+) Io.Cancelable!void {
+    const result: WriteResult = if (parent.io.vtable.netWrite(parent.io.userdata, parent.stream.socket.handle, header, data, splat)) |n|
+        .{ .wrote = n }
+    else |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => .{ .failed = err },
+    };
+    queue.putOne(parent.io, result) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.Closed => {},
+    };
+}
+
+fn writeTimeoutTask(io: Io, write_timeout_ms: u32, queue: *Io.Queue(WriteResult)) Io.Cancelable!void {
+    try Io.Timeout.sleep(timeoutFromMs(write_timeout_ms), io);
+    queue.putOne(io, .timed_out) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.Closed => {},
+    };
+}
+
+const DialResult = union(enum) {
+    connected: Io.net.Stream,
+    failed: ConnectError,
+    timed_out,
+};
+
+fn connectWithTimeout(io: Io, host: []const u8, port: u16, dial_timeout_ms: u32) ConnectError!Io.net.Stream {
+    if (dial_timeout_ms == 0) return connectNoStdTimeout(io, host, port);
+
+    var queue_storage: [2]DialResult = undefined;
+    var queue: Io.Queue(DialResult) = .init(&queue_storage);
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+
+    try group.concurrent(io, connectTask, .{ io, host, port, &queue });
+    try group.concurrent(io, timeoutTask, .{ io, dial_timeout_ms, &queue });
+
+    const first = queue.getOne(io) catch |e| switch (e) {
+        error.Canceled => return error.Canceled,
+        error.Closed => return error.ConnectionTimeout,
+    };
+    switch (first) {
+        .connected => |stream| return stream,
+        .failed => |err| return err,
+        .timed_out => return error.ConnectionTimeout,
+    }
+}
+
+fn connectTask(io: Io, host: []const u8, port: u16, queue: *Io.Queue(DialResult)) Io.Cancelable!void {
+    const result: DialResult = if (connectNoStdTimeout(io, host, port)) |stream|
+        .{ .connected = stream }
+    else |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => .{ .failed = err },
+    };
+    queue.putOne(io, result) catch |e| switch (e) {
+        error.Canceled => return error.Canceled,
+        error.Closed => switch (result) {
+            .connected => |stream| stream.close(io),
+            else => {},
+        },
+    };
+}
+
+fn timeoutTask(io: Io, dial_timeout_ms: u32, queue: *Io.Queue(DialResult)) Io.Cancelable!void {
+    const duration: Io.Clock.Duration = .{
+        .raw = .fromMilliseconds(dial_timeout_ms),
+        .clock = .awake,
+    };
+    try Io.Timeout.sleep(.{ .duration = duration }, io);
+    queue.putOne(io, .timed_out) catch |e| switch (e) {
+        error.Canceled => return error.Canceled,
+        error.Closed => {},
+    };
+}
+
+fn connectNoStdTimeout(io: Io, host: []const u8, port: u16) ConnectError!Io.net.Stream {
+    // std.Io.Threaded panics on both Windows and POSIX if
+    // options.timeout != .none as of Zig 0.16.0. Always pass .none
+    // and let connectWithTimeout provide the budget.
+    if (Io.net.IpAddress.parse(host, port)) |addr| {
+        return Io.net.IpAddress.connect(&addr, io, .{
+            .mode = .stream,
+            .timeout = .none,
+        }) catch |e| mapConnectError(e);
+    } else |_| {
+        const hn = Io.net.HostName.init(host) catch return error.InvalidHost;
+        return Io.net.HostName.connect(hn, io, port, .{
+            .mode = .stream,
+            .timeout = .none,
+        }) catch |e| mapHostConnectError(e);
+    }
+}
 
 fn mapConnectError(e: Io.net.IpAddress.ConnectError) ConnectError {
     return switch (e) {
@@ -247,6 +561,8 @@ test "Transport vtable round-trips through anyopaque" {
         }
         fn srtImpl(_: *anyopaque, _: ?u32) anyerror!void {}
         fn swtImpl(_: *anyopaque, _: ?u32) anyerror!void {}
+        fn lreImpl(_: *anyopaque) ?anyerror { return null; }
+        fn lweImpl(_: *anyopaque) ?anyerror { return null; }
     };
 
     var mock: Mock = .{ .r = &rdr, .w = &wtr };
@@ -256,6 +572,8 @@ test "Transport vtable round-trips through anyopaque" {
         .close = Mock.cImpl,
         .setReadTimeout = Mock.srtImpl,
         .setWriteTimeout = Mock.swtImpl,
+        .lastReadError = Mock.lreImpl,
+        .lastWriteError = Mock.lweImpl,
     };
     const t: Transport = .{ .ptr = &mock, .vtable = &vt };
 

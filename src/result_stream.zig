@@ -33,6 +33,7 @@ const exception = @import("exception.zig");
 const block_mod = @import("block.zig");
 const cherror = @import("cherror.zig");
 const compression_mod = @import("compression.zig");
+const transport_mod = @import("transport.zig");
 
 pub const Progress = struct {
     read_rows: u64 = 0,
@@ -89,6 +90,7 @@ pub const Packet = union(enum) {
 pub const Error = error{
     UnexpectedPacket,
     ProtocolError,
+    ReadTimeout,
 };
 
 pub const ResultStream = struct {
@@ -99,6 +101,7 @@ pub const ResultStream = struct {
     /// compression frame. Set by Client.query when the per-query
     /// compression flag is on. Synthetic-byte tests leave it Disable.
     compression: protocol.CompressionEnabled = .Disable,
+    transport: ?transport_mod.Transport = null,
     /// Hooks back into the parent Client so we can flip state back to
     /// .ready / .broken when the stream terminates. Held by value so
     /// no dangling-pointer hazard from a stack-local view; the inner
@@ -118,7 +121,7 @@ pub const ResultStream = struct {
         if (self.finished) return null;
         const packet_id = wire.readServerPacketId(self.reader) catch |e| {
             self.markBroken();
-            return e;
+            return self.mapReadError(e);
         };
         // Per upstream Connection::receivePacket: Data / Totals / Extremes
         // always ride through `maybe_compressed_in` when general
@@ -144,7 +147,7 @@ pub const ResultStream = struct {
             .Exception => {
                 const exc = exception.readException(self.reader, self.allocator) catch |e| {
                     self.markBroken();
-                    return e;
+                    return self.mapReadError(e);
                 };
                 self.markFinishedReady();
                 return .{ .exception = exc };
@@ -167,12 +170,24 @@ pub const ResultStream = struct {
         // hand ownership to `block.readMaybeCompressed`.
         const table_name = wire.readStringOwned(self.reader, self.allocator, wire.MAX_DEFAULT_STRING) catch |e| {
             self.markBroken();
-            return e;
+            return self.mapReadError(e);
         };
         return block_mod.readMaybeCompressed(self.reader, self.allocator, self.server_revision, table_name, mode) catch |e| {
             self.markBroken();
-            return e;
+            return self.mapReadError(e);
         };
+    }
+
+    fn mapReadError(self: *ResultStream, e: anyerror) anyerror {
+        if (e == error.Timeout) return error.ReadTimeout;
+        if (e == error.ReadFailed) {
+            if (self.transport) |t| {
+                if (t.lastReadError()) |err| {
+                    if (err == error.Timeout) return error.ReadTimeout;
+                }
+            }
+        }
+        return e;
     }
 
     fn readProgress(self: *ResultStream) !Progress {
@@ -466,4 +481,35 @@ test "ResultStream at revision >= 54_481 reads ProfileEvents COMPRESSED via the 
     try testing.expect(p == .profile_events);
     defer p.profile_events.deinit();
     try testing.expect(p.profile_events.isEmpty());
+}
+
+test "ResultStream at revision >= 54_481 reads Log COMPRESSED via the gate" {
+    const ally = testing.allocator;
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+
+    try varint.writeVarUInt(&w, @intFromEnum(protocol.ServerPacket.Log));
+    try wire.writeStringBinary(&w, "");
+    var body_buf: [32]u8 = undefined;
+    var bw: std.Io.Writer = .fixed(&body_buf);
+    try varint.writeVarUInt(&bw, 1);
+    try bw.writeByte(0);
+    try varint.writeVarUInt(&bw, 2);
+    try bw.writeInt(i32, -1, .little);
+    try varint.writeVarUInt(&bw, 0);
+    try varint.writeVarUInt(&bw, 0);
+    try varint.writeVarUInt(&bw, 0);
+    try compression_mod.writeFrameLz4(&w, ally, bw.buffered());
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var stream: ResultStream = .{
+        .reader = &r,
+        .allocator = ally,
+        .server_revision = protocol.Revision.WITH_COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS,
+        .compression = .Enable,
+    };
+    const p = (try stream.next()).?;
+    try testing.expect(p == .log);
+    defer p.log.deinit();
+    try testing.expect(p.log.isEmpty());
 }

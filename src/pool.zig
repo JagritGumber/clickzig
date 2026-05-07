@@ -6,9 +6,9 @@
 //! workloads viable.
 //!
 //! Lifecycle:
-//!   var pool = try Pool.init(config, .{ .max_size = 8 });
+//!   var pool = try Pool.init(allocator, io, config, .{ .max_size = 8 });
 //!   defer pool.deinit();
-//!   const client = try pool.acquire(io, null);
+//!   const client = try pool.acquire(null);
 //!   defer pool.release(client);
 //!   try client.ping(null);
 //!

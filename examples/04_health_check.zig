@@ -7,7 +7,7 @@
 //! most one in-flight operation.
 //!
 //! Concepts:
-//!   - `?*const std.atomic.Value(bool)` is the v0.16.0-alpha
+//!   - `?*const std.atomic.Value(bool)` is the v0.16.0
 //!     cancellation primitive (a future major may switch to Io.Cancel).
 //!   - Polling cadence is documented per-operation in client.zig.
 //!   - `client.isReusable()` lets a future Pool decide whether to

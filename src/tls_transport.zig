@@ -173,6 +173,8 @@ pub const TlsTransport = struct {
         .close = closeImpl,
         .setReadTimeout = setReadTimeoutImpl,
         .setWriteTimeout = setWriteTimeoutImpl,
+        .lastReadError = lastReadErrorImpl,
+        .lastWriteError = lastWriteErrorImpl,
     };
 
     fn readerImpl(ptr: *anyopaque) *Io.Reader {
@@ -190,9 +192,19 @@ pub const TlsTransport = struct {
     fn setReadTimeoutImpl(ptr: *anyopaque, ms: ?u32) anyerror!void {
         const self: *TlsTransport = @ptrCast(@alignCast(ptr));
         self.read_timeout_ms = ms;
+        try self.inner.transport().setReadTimeout(ms);
     }
     fn setWriteTimeoutImpl(ptr: *anyopaque, ms: ?u32) anyerror!void {
         const self: *TlsTransport = @ptrCast(@alignCast(ptr));
         self.write_timeout_ms = ms;
+        try self.inner.transport().setWriteTimeout(ms);
+    }
+    fn lastReadErrorImpl(ptr: *anyopaque) ?anyerror {
+        const self: *TlsTransport = @ptrCast(@alignCast(ptr));
+        return self.inner.transport().lastReadError();
+    }
+    fn lastWriteErrorImpl(ptr: *anyopaque) ?anyerror {
+        const self: *TlsTransport = @ptrCast(@alignCast(ptr));
+        return self.inner.transport().lastWriteError();
     }
 };
