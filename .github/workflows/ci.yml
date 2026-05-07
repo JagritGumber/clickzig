@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 0.16.0]
   pull_request:
-    branches: [main]
+    branches: [main, 0.16.0]
 
 jobs:
   unit-tests:
@@ -17,6 +17,8 @@ jobs:
           version: 0.16.0
       - name: zig build test
         run: zig build test --summary all
+      - name: zig build audit
+        run: zig build audit --summary all
       - name: zig build examples (compile-only)
         run: zig build examples --summary all
 
@@ -75,17 +77,39 @@ jobs:
         run: zig build smoke -- complex-types
       - name: smoke pool
         run: zig build smoke -- pool
+      - name: smoke pool-loop
+        run: zig build smoke -- pool-loop
       - name: smoke dsn
         run: zig build smoke -- dsn
       - name: smoke decimal-ip
         run: zig build smoke -- decimal-ip
       - name: smoke tuple-map
         run: zig build smoke -- tuple-map
-      - name: smoke compression
-        run: zig build smoke -- compression
-      - name: smoke insert-compression
-        run: zig build smoke -- insert-compression
+      - name: smoke compression aggregate
+        run: zig build smoke-compression
+      - name: smoke insert-zstd
+        run: zig build smoke -- insert-zstd
+      - name: smoke nested compressed insert
+        run: zig build smoke -- nested-compressed-insert
+      - name: smoke timeout
+        run: zig build smoke -- timeout
+      - name: smoke read-timeout
+        run: zig build smoke -- read-timeout
+      - name: smoke write-timeout
+        run: zig build smoke -- write-timeout
+      - name: smoke parameters
+        run: zig build smoke -- parameters
+      - name: smoke geo
+        run: zig build smoke -- geo
+      - name: smoke external-data
+        run: zig build smoke -- external-data
+      - name: smoke combined features
+        run: zig build smoke -- combined-features
+      - name: smoke column coverage
+        run: zig build smoke -- column-coverage
       - name: smoke lowcardinality
         run: zig build smoke -- lowcardinality
       - name: smoke lc-write
         run: zig build smoke -- lc-write
+      - name: branch-readiness smoke aggregate
+        run: zig build smoke-readiness

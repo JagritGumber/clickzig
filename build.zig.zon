@@ -10,6 +10,7 @@
         "examples",
         "build.zig",
         "build.zig.zon",
+        ".zigversion",
         "LICENSE",
         "README.md",
     },

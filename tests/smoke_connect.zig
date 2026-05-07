@@ -10,6 +10,7 @@
 //! /wrong-pass scenarios.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const clickzig = @import("clickzig");
 
 pub fn main(init: std.process.Init) !void {
@@ -47,20 +48,486 @@ pub fn main(init: std.process.Init) !void {
         try runDsn(allocator, io);
     } else if (std.mem.eql(u8, scenario, "decimal-ip")) {
         try runDecimalIp(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "column-coverage")) {
+        try runColumnCoverage(allocator, io);
     } else if (std.mem.eql(u8, scenario, "tuple-map")) {
         try runTupleMap(allocator, io);
     } else if (std.mem.eql(u8, scenario, "compression")) {
         try runCompression(allocator, io);
     } else if (std.mem.eql(u8, scenario, "insert-compression")) {
-        try runInsertCompression(allocator, io);
+        try runInsertCompression(allocator, io, .lz4);
+    } else if (std.mem.eql(u8, scenario, "insert-zstd")) {
+        try runInsertCompression(allocator, io, .zstd);
     } else if (std.mem.eql(u8, scenario, "lowcardinality")) {
         try runLowCardinality(allocator, io);
     } else if (std.mem.eql(u8, scenario, "lc-write")) {
         try runLowCardinalityWrite(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "timeout")) {
+        try runTimeout(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "read-timeout")) {
+        try runReadTimeout(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "write-timeout")) {
+        try runWriteTimeout(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "json")) {
+        try runJson(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "dynamic")) {
+        try runDynamic(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "parameters")) {
+        try runParameters(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "geo")) {
+        try runGeo(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "external-data")) {
+        try runExternalData(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "combined-features")) {
+        try runCombinedFeatures(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "nested-compressed-insert")) {
+        try runNestedCompressedInsert(allocator, io);
+    } else if (std.mem.eql(u8, scenario, "pool-loop")) {
+        try runPoolLoop(allocator, io);
     } else {
-        std.debug.print("usage: smoke_connect [happy|ping|wrong-pass|unreachable|wrong-host|query-bytes|query-mixed|insert-roundtrip|nullable-roundtrip|complex-types|pool|dsn|decimal-ip|tuple-map|compression|insert-compression|lowcardinality|lc-write]\n", .{});
+        std.debug.print("usage: smoke_connect [happy|ping|wrong-pass|unreachable|wrong-host|query-bytes|query-mixed|insert-roundtrip|nullable-roundtrip|complex-types|pool|dsn|decimal-ip|column-coverage|tuple-map|compression|insert-compression|insert-zstd|lowcardinality|lc-write|timeout|read-timeout|write-timeout|json|dynamic|parameters|geo|external-data|combined-features|nested-compressed-insert|pool-loop]\n", .{});
         return error.UnknownScenario;
     }
+}
+
+fn drainNoException(stream: *clickzig.ResultStream, label: []const u8) !void {
+    while (try stream.next()) |p| switch (p) {
+        .end_of_stream => break,
+        .exception => |e| {
+            std.debug.print("[{s}] exception: {s}\n", .{ label, e.message });
+            return error.QueryFailed;
+        },
+        else => {},
+    };
+}
+
+fn runExternalData(allocator: std.mem.Allocator, io: std.Io) !void {
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    defer client.close();
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+
+    var xs = [_]u64{ 1, 2, 3 };
+    var labels = [_][]u8{ @constCast("skip"), @constCast("keep"), @constCast("keep") };
+    const cols = [_]clickzig.block.InsertColumn{
+        .{ .name = "x", .type_name = "UInt64", .data = .{ .UInt64 = &xs } },
+        .{ .name = "label", .type_name = "String", .data = .{ .String = &labels } },
+    };
+    const external = [_]clickzig.ExternalTable{
+        .{ .name = "ext_data", .num_rows = 3, .columns = &cols },
+    };
+
+    var stream = try client.query(
+        "SELECT sum(x) AS total, count() AS n FROM ext_data WHERE label = 'keep'",
+        arena.allocator(),
+        null,
+        .{ .external_tables = &external },
+    );
+    var seen = false;
+    while (try stream.next()) |p| switch (p) {
+        .data => |b| {
+            if (b.num_rows == 0) continue;
+            seen = true;
+            if (b.columns[0].column.UInt64[0] != 5) return error.ExternalDataMismatch;
+            if (b.columns[1].column.UInt64[0] != 2) return error.ExternalDataMismatch;
+        },
+        .end_of_stream => break,
+        .exception => |e| { std.debug.print("[external-data] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        else => {},
+    };
+    if (!seen) return error.UnexpectedRowCount;
+    std.debug.print("[external-data] OK\n", .{});
+}
+
+fn runCombinedFeatures(allocator: std.mem.Allocator, io: std.Io) !void {
+    var cfg = baseConfig(allocator);
+    cfg.compression = .Enable;
+    const client = try clickzig.Client.connectTcp(cfg, io, null, null);
+    defer client.close();
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+
+    var params: clickzig.Parameters = .{};
+    defer params.deinit(arena.allocator());
+    try params.putUInt(arena.allocator(), "min_x", @as(u64, 1));
+    try params.putString(arena.allocator(), "wanted", "keep");
+
+    var settings: clickzig.settings.Map = .empty;
+    defer settings.deinit(arena.allocator());
+    try settings.put(arena.allocator(), "max_threads", "1");
+
+    var xs = [_]u64{ 1, 2, 3, 4 };
+    var labels = [_][]u8{ @constCast("skip"), @constCast("keep"), @constCast("keep"), @constCast("skip") };
+    const cols = [_]clickzig.block.InsertColumn{
+        .{ .name = "x", .type_name = "UInt64", .data = .{ .UInt64 = &xs } },
+        .{ .name = "label", .type_name = "String", .data = .{ .String = &labels } },
+    };
+    const external = [_]clickzig.ExternalTable{
+        .{ .name = "combo_ext", .num_rows = 4, .columns = &cols },
+    };
+
+    var stream = try client.query(
+        "SELECT sum(x) AS total, count() AS n FROM combo_ext WHERE x > {min_x:UInt64} AND label = {wanted:String}",
+        arena.allocator(),
+        null,
+        .{ .compression = .Enable, .settings = &settings, .parameters = &params, .external_tables = &external },
+    );
+    var seen = false;
+    while (try stream.next()) |p| switch (p) {
+        .data => |b| {
+            if (b.num_rows == 0) continue;
+            seen = true;
+            if (b.columns[0].column.UInt64[0] != 5) return error.CombinedFeatureMismatch;
+            if (b.columns[1].column.UInt64[0] != 2) return error.CombinedFeatureMismatch;
+        },
+        .end_of_stream => break,
+        .exception => |e| { std.debug.print("[combined-features] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        else => {},
+    };
+    if (!seen) return error.UnexpectedRowCount;
+    std.debug.print("[combined-features] OK\n", .{});
+}
+
+fn runGeo(allocator: std.mem.Allocator, io: std.Io) !void {
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    defer client.close();
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+
+    var stream = try client.query(
+        \\SELECT
+        \\    CAST((1.25, 2.5), 'Point') AS p,
+        \\    CAST([(0., 0.), (1., 0.), (1., 1.)], 'Ring') AS r,
+        \\    CAST([(0., 0.), (2., 2.)], 'LineString') AS line,
+        \\    CAST([[(0., 0.), (2., 2.)], [(3., 3.), (4., 4.)]], 'MultiLineString') AS multiline,
+        \\    CAST([[(0., 0.), (1., 0.), (1., 1.)]], 'Polygon') AS poly,
+        \\    CAST([[[(0., 0.), (1., 0.), (1., 1.)]]], 'MultiPolygon') AS multipoly
+    , arena.allocator(), null, .{});
+    var seen = false;
+    while (try stream.next()) |p| switch (p) {
+        .data => |b| {
+            if (b.num_rows == 0) continue;
+            seen = true;
+            const point = b.columns[0].column.Tuple;
+            if (point.elements[0].Float64[0] != 1.25 or point.elements[1].Float64[0] != 2.5) return error.GeoMismatch;
+
+            const ring = b.columns[1].column.Array;
+            if (ring.offsets[0] != 3) return error.GeoMismatch;
+            if (ring.inner.Tuple.elements[0].Float64[2] != 1.0) return error.GeoMismatch;
+            if (ring.inner.Tuple.elements[1].Float64[2] != 1.0) return error.GeoMismatch;
+
+            const line = b.columns[2].column.Array;
+            if (line.offsets[0] != 2) return error.GeoMismatch;
+            if (line.inner.Tuple.elements[0].Float64[1] != 2.0) return error.GeoMismatch;
+
+            const multiline = b.columns[3].column.Array;
+            if (multiline.offsets[0] != 2) return error.GeoMismatch;
+            if (multiline.inner.Array.offsets[0] != 2) return error.GeoMismatch;
+            if (multiline.inner.Array.offsets[1] != 4) return error.GeoMismatch;
+
+            const poly = b.columns[4].column.Array;
+            if (poly.offsets[0] != 1) return error.GeoMismatch;
+            if (poly.inner.Array.offsets[0] != 3) return error.GeoMismatch;
+
+            const multipoly = b.columns[5].column.Array;
+            if (multipoly.offsets[0] != 1) return error.GeoMismatch;
+            if (multipoly.inner.Array.offsets[0] != 1) return error.GeoMismatch;
+            if (multipoly.inner.Array.inner.Array.offsets[0] != 3) return error.GeoMismatch;
+        },
+        .end_of_stream => break,
+        .exception => |e| { std.debug.print("[geo] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        else => {},
+    };
+    if (!seen) return error.UnexpectedRowCount;
+
+    {
+        var s = try client.query("DROP TABLE IF EXISTS smoke_geo", arena.allocator(), null, .{});
+        try drainNoException(&s, "geo-drop");
+    }
+    {
+        var s = try client.query(
+            \\CREATE TABLE smoke_geo (
+            \\    p Point,
+            \\    r Ring,
+            \\    line LineString,
+            \\    multiline MultiLineString,
+            \\    poly Polygon,
+            \\    multipoly MultiPolygon
+            \\) ENGINE = Memory
+        , arena.allocator(), null, .{});
+        try drainNoException(&s, "geo-create");
+    }
+
+    var p_x = [_]f64{9.0};
+    var p_y = [_]f64{10.0};
+    var p_elements = [_]clickzig.Column{ .{ .Float64 = &p_x }, .{ .Float64 = &p_y } };
+    var point_box: clickzig.column.Tuple = .{ .row_count = 1, .elements = &p_elements };
+
+    var r_x = [_]f64{ 0.0, 1.0, 1.0 };
+    var r_y = [_]f64{ 0.0, 0.0, 1.0 };
+    var r_elements = [_]clickzig.Column{ .{ .Float64 = &r_x }, .{ .Float64 = &r_y } };
+    var r_tuple: clickzig.column.Tuple = .{ .row_count = 3, .elements = &r_elements };
+    var r_offsets = [_]u64{3};
+    var ring_box: clickzig.column.Array = .{ .offsets = &r_offsets, .inner = .{ .Tuple = &r_tuple } };
+
+    var line_x = [_]f64{ 0.0, 2.0 };
+    var line_y = [_]f64{ 0.0, 2.0 };
+    var line_elements = [_]clickzig.Column{ .{ .Float64 = &line_x }, .{ .Float64 = &line_y } };
+    var line_tuple: clickzig.column.Tuple = .{ .row_count = 2, .elements = &line_elements };
+    var line_offsets = [_]u64{2};
+    var line_box: clickzig.column.Array = .{ .offsets = &line_offsets, .inner = .{ .Tuple = &line_tuple } };
+
+    var ml_x = [_]f64{ 0.0, 2.0, 3.0, 4.0 };
+    var ml_y = [_]f64{ 0.0, 2.0, 3.0, 4.0 };
+    var ml_elements = [_]clickzig.Column{ .{ .Float64 = &ml_x }, .{ .Float64 = &ml_y } };
+    var ml_tuple: clickzig.column.Tuple = .{ .row_count = 4, .elements = &ml_elements };
+    var ml_line_offsets = [_]u64{ 2, 4 };
+    var ml_lines_box: clickzig.column.Array = .{ .offsets = &ml_line_offsets, .inner = .{ .Tuple = &ml_tuple } };
+    var ml_offsets = [_]u64{2};
+    var multiline_box: clickzig.column.Array = .{ .offsets = &ml_offsets, .inner = .{ .Array = &ml_lines_box } };
+
+    var poly_x = [_]f64{ 0.0, 1.0, 1.0 };
+    var poly_y = [_]f64{ 0.0, 0.0, 1.0 };
+    var poly_elements = [_]clickzig.Column{ .{ .Float64 = &poly_x }, .{ .Float64 = &poly_y } };
+    var poly_tuple: clickzig.column.Tuple = .{ .row_count = 3, .elements = &poly_elements };
+    var poly_ring_offsets = [_]u64{3};
+    var poly_ring_box: clickzig.column.Array = .{ .offsets = &poly_ring_offsets, .inner = .{ .Tuple = &poly_tuple } };
+    var poly_offsets = [_]u64{1};
+    var poly_box: clickzig.column.Array = .{ .offsets = &poly_offsets, .inner = .{ .Array = &poly_ring_box } };
+
+    var mp_x = [_]f64{ 0.0, 1.0, 1.0 };
+    var mp_y = [_]f64{ 0.0, 0.0, 1.0 };
+    var mp_elements = [_]clickzig.Column{ .{ .Float64 = &mp_x }, .{ .Float64 = &mp_y } };
+    var mp_tuple: clickzig.column.Tuple = .{ .row_count = 3, .elements = &mp_elements };
+    var mp_ring_offsets = [_]u64{3};
+    var mp_ring_box: clickzig.column.Array = .{ .offsets = &mp_ring_offsets, .inner = .{ .Tuple = &mp_tuple } };
+    var mp_poly_offsets = [_]u64{1};
+    var mp_poly_box: clickzig.column.Array = .{ .offsets = &mp_poly_offsets, .inner = .{ .Array = &mp_ring_box } };
+    var mp_offsets = [_]u64{1};
+    var multipoly_box: clickzig.column.Array = .{ .offsets = &mp_offsets, .inner = .{ .Array = &mp_poly_box } };
+
+    const cols = [_]clickzig.block.InsertColumn{
+        .{ .name = "p", .type_name = "Point", .data = .{ .Tuple = &point_box } },
+        .{ .name = "r", .type_name = "Ring", .data = .{ .Array = &ring_box } },
+        .{ .name = "line", .type_name = "LineString", .data = .{ .Array = &line_box } },
+        .{ .name = "multiline", .type_name = "MultiLineString", .data = .{ .Array = &multiline_box } },
+        .{ .name = "poly", .type_name = "Polygon", .data = .{ .Array = &poly_box } },
+        .{ .name = "multipoly", .type_name = "MultiPolygon", .data = .{ .Array = &multipoly_box } },
+    };
+    try client.insert("INSERT INTO smoke_geo (p, r, line, multiline, poly, multipoly) FORMAT Native", "", 1, &cols, arena.allocator(), null, .{});
+
+    var back = try client.query("SELECT p, r, line, multiline, poly, multipoly FROM smoke_geo", arena.allocator(), null, .{});
+    var roundtrip_seen = false;
+    while (try back.next()) |p| switch (p) {
+        .data => |b| {
+            if (b.num_rows == 0) continue;
+            roundtrip_seen = true;
+            if (b.columns[0].column.Tuple.elements[0].Float64[0] != 9.0) return error.GeoMismatch;
+            if (b.columns[1].column.Array.offsets[0] != 3) return error.GeoMismatch;
+            if (b.columns[2].column.Array.offsets[0] != 2) return error.GeoMismatch;
+            if (b.columns[3].column.Array.inner.Array.offsets[1] != 4) return error.GeoMismatch;
+            if (b.columns[4].column.Array.inner.Array.offsets[0] != 3) return error.GeoMismatch;
+            if (b.columns[5].column.Array.inner.Array.inner.Array.offsets[0] != 3) return error.GeoMismatch;
+        },
+        .end_of_stream => break,
+        .exception => |e| { std.debug.print("[geo] roundtrip exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        else => {},
+    };
+    if (!roundtrip_seen) return error.UnexpectedRowCount;
+    std.debug.print("[geo] OK\n", .{});
+}
+
+fn runParameters(allocator: std.mem.Allocator, io: std.Io) !void {
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    defer client.close();
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+
+    var params: clickzig.Parameters = .{};
+    defer params.deinit(arena.allocator());
+    try params.putUInt(arena.allocator(), "n", @as(u64, 41));
+    try params.putString(arena.allocator(), "s", "clickzig");
+    try params.putDate(arena.allocator(), "d", "2026-05-07");
+
+    var stream = try client.query(
+        "SELECT {n:UInt64} + 1 AS answer, {s:String} AS label, toDate({d:String}) AS day",
+        arena.allocator(),
+        null,
+        .{ .parameters = &params },
+    );
+    var seen = false;
+    while (try stream.next()) |p| switch (p) {
+        .data => |b| {
+            if (b.num_rows == 0) continue;
+            seen = true;
+            if (b.columns[0].column.UInt64[0] != 42) return error.ParameterMismatch;
+            if (!std.mem.eql(u8, b.columns[1].column.String[0], "clickzig")) return error.ParameterMismatch;
+            if (b.columns[2].column.UInt16[0] == 0) return error.ParameterMismatch;
+        },
+        .end_of_stream => break,
+        .exception => |e| {
+            std.debug.print("[parameters] exception: {s}\n", .{e.message});
+            return error.QueryFailed;
+        },
+        else => {},
+    };
+    if (!seen) return error.UnexpectedRowCount;
+    std.debug.print("[parameters] OK\n", .{});
+}
+
+fn customTypeSettings(allocator: std.mem.Allocator) !clickzig.settings.Map {
+    var settings: clickzig.settings.Map = .empty;
+    try settings.put(allocator, "allow_experimental_json_type", "1");
+    try settings.put(allocator, "allow_experimental_dynamic_type", "1");
+    try settings.put(allocator, "output_format_native_write_json_as_string", "1");
+    try settings.put(allocator, "output_format_native_use_flattened_dynamic_and_json_serialization", "1");
+    return settings;
+}
+
+fn runJson(allocator: std.mem.Allocator, io: std.Io) !void {
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    defer client.close();
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    var settings = try customTypeSettings(arena.allocator());
+    var s = try client.query("SELECT toJSONString(CAST('{\"a\":1}' AS JSON)) AS j", arena.allocator(), null, .{ .settings = &settings });
+    var seen = false;
+    while (try s.next()) |p| switch (p) {
+        .data => |b| {
+            if (b.num_rows == 0) continue;
+            seen = true;
+            switch (b.columns[0].column) {
+                .JSON => |rows| if (!std.mem.eql(u8, rows[0], "{\"a\":1}")) {
+                    std.debug.print("[json] got '{s}'\n", .{rows[0]});
+                    return error.JsonMismatch;
+                },
+                .String => |rows| if (!std.mem.eql(u8, rows[0], "{\"a\":1}")) {
+                    std.debug.print("[json] got '{s}'\n", .{rows[0]});
+                    return error.JsonMismatch;
+                },
+                else => return error.JsonMismatch,
+            }
+        },
+        .end_of_stream => break,
+        .exception => |e| { std.debug.print("[json] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        else => {},
+    };
+    if (!seen) return error.UnexpectedRowCount;
+    std.debug.print("[json] OK\n", .{});
+}
+
+fn runDynamic(allocator: std.mem.Allocator, io: std.Io) !void {
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    defer client.close();
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    var settings = try customTypeSettings(arena.allocator());
+    var s = try client.query("SELECT toString(CAST(number AS Dynamic)) AS d FROM numbers(2)", arena.allocator(), null, .{ .settings = &settings });
+    var rows: u64 = 0;
+    while (try s.next()) |p| switch (p) {
+        .data => |b| {
+            rows += b.num_rows;
+            if (b.num_rows == 0) continue;
+            if (b.columns[0].column.len() != b.num_rows) return error.DynamicMismatch;
+        },
+        .end_of_stream => break,
+        .exception => |e| { std.debug.print("[dynamic] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        else => {},
+    };
+    if (rows != 2) return error.UnexpectedRowCount;
+    std.debug.print("[dynamic] OK\n", .{});
+}
+
+fn runTimeout(allocator: std.mem.Allocator, io: std.Io) !void {
+    var cfg = baseConfig(allocator);
+    if (builtin.os.tag == .windows) {
+        // Zig 0.16's Windows threaded backend prints an internal
+        // ACCESS_DENIED trace when a pending AFD connect is canceled.
+        // Keep the Windows smoke quiet; Linux CI exercises the real
+        // timeout path against TEST-NET-1 below.
+        cfg.host = "127.0.0.1";
+        cfg.port = 1;
+    } else {
+        cfg.host = "192.0.2.1";
+    }
+    cfg.dial_timeout_ms = 50;
+    const started = std.Io.Clock.now(.awake, io);
+    const result = clickzig.Client.connectTcp(cfg, io, null, null);
+    if (result) |c| {
+        c.close();
+        return error.UnexpectedSuccess;
+    } else |e| {
+        const elapsed_ms = started.durationTo(std.Io.Clock.now(.awake, io)).toMilliseconds();
+        if (e != error.ConnectTimeout and e != error.HostUnreachable and e != error.ConnectionFailed and e != error.ConnectionRefused) return e;
+        if (elapsed_ms > 5_000) return error.TimeoutBudgetIgnored;
+        std.debug.print("[timeout] OK: {s} after {d}ms\n", .{ @errorName(e), elapsed_ms });
+    }
+}
+
+fn runReadTimeout(allocator: std.mem.Allocator, io: std.Io) !void {
+    var cfg = baseConfig(allocator);
+    var addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    cfg.host = "127.0.0.1";
+    cfg.port = server.socket.address.getPort();
+    cfg.read_timeout_ms = 50;
+
+    const started = std.Io.Clock.now(.awake, io);
+    const result = clickzig.Client.connectTcp(cfg, io, null, null);
+    if (result) |client| {
+        client.close();
+        return error.UnexpectedSuccess;
+    } else |e| {
+        const elapsed_ms = started.durationTo(std.Io.Clock.now(.awake, io)).toMilliseconds();
+        if (e != error.ReadTimeout) return e;
+        if (elapsed_ms > 5_000) return error.TimeoutBudgetIgnored;
+        std.debug.print("[read-timeout] OK after {d}ms\n", .{elapsed_ms});
+    }
+}
+
+fn runWriteTimeout(allocator: std.mem.Allocator, io: std.Io) !void {
+    var addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    const tcp = try clickzig.TcpTransport.connect(allocator, io, "127.0.0.1", server.socket.address.getPort(), .{
+        .read_buffer_size = 4096,
+        .write_buffer_size = 4096,
+        .dial_timeout_ms = 1000,
+    });
+    defer {
+        tcp.deinit();
+        allocator.destroy(tcp);
+    }
+    try tcp.transport().setWriteTimeout(50);
+
+    var chunk: [1024 * 1024]u8 = undefined;
+    @memset(&chunk, 0xA5);
+    const started = std.Io.Clock.now(.awake, io);
+    var wrote: usize = 0;
+    while (wrote < 1024) : (wrote += 1) {
+        tcp.transport().writer().writeAll(&chunk) catch |e| {
+            const elapsed_ms = started.durationTo(std.Io.Clock.now(.awake, io)).toMilliseconds();
+            if (e != error.WriteFailed) return e;
+            const last = tcp.transport().lastWriteError() orelse return error.UnexpectedTimeoutError;
+            if (last != error.Timeout) return last;
+            if (elapsed_ms > 5_000) return error.TimeoutBudgetIgnored;
+            std.debug.print("[write-timeout] OK after {d}ms ({d} MiB attempted)\n", .{ elapsed_ms, wrote + 1 });
+            return;
+        };
+        tcp.transport().writer().flush() catch |e| {
+            const elapsed_ms = started.durationTo(std.Io.Clock.now(.awake, io)).toMilliseconds();
+            if (e != error.WriteFailed) return e;
+            const last = tcp.transport().lastWriteError() orelse return error.UnexpectedTimeoutError;
+            if (last != error.Timeout) return last;
+            if (elapsed_ms > 5_000) return error.TimeoutBudgetIgnored;
+            std.debug.print("[write-timeout] OK after {d}ms ({d} MiB attempted)\n", .{ elapsed_ms, wrote + 1 });
+            return;
+        };
+    }
+    return error.UnexpectedSuccess;
 }
 
 fn runLowCardinalityWrite(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -359,6 +826,44 @@ fn runDecimalIp(allocator: std.mem.Allocator, io: std.Io) !void {
     std.debug.print("[decimal-ip] OK\n", .{});
 }
 
+fn runColumnCoverage(allocator: std.mem.Allocator, io: std.Io) !void {
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    defer client.close();
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+
+    var s = try client.query(
+        \\SELECT
+        \\    toDateTime64('1960-01-01 00:00:00', 3, 'UTC') AS dt64,
+        \\    CAST(42, 'SimpleAggregateFunction(sum, UInt64)') AS saf,
+        \\    CAST([(1, 'a'), (2, 'b')], 'Nested(id UInt32, name String)') AS nested_col,
+        \\    toIntervalDay(3) AS interval_day
+    , arena.allocator(), null, .{});
+    var seen = false;
+    while (try s.next()) |p| switch (p) {
+        .data => |b| {
+            if (b.num_rows == 0) continue;
+            seen = true;
+            const dt64 = b.columns[0].column.Int64[0];
+            const saf = b.columns[1].column.UInt64[0];
+            const nested = b.columns[2].column.Array;
+            const interval_day = b.columns[3].column.Int64[0];
+
+            if (dt64 != -315619200000) return error.DateTime64Mismatch;
+            if (saf != 42) return error.SimpleAggregateMismatch;
+            if (nested.offsets[0] != 2) return error.NestedMismatch;
+            if (nested.inner.Tuple.elements[0].UInt32[1] != 2) return error.NestedMismatch;
+            if (!std.mem.eql(u8, nested.inner.Tuple.elements[1].String[1], "b")) return error.NestedMismatch;
+            if (interval_day != 3) return error.IntervalMismatch;
+        },
+        .end_of_stream => break,
+        .exception => |e| { std.debug.print("[column-coverage] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        else => {},
+    };
+    if (!seen) return error.UnexpectedRowCount;
+    std.debug.print("[column-coverage] OK\n", .{});
+}
+
 fn runDsn(allocator: std.mem.Allocator, io: std.Io) !void {
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -401,6 +906,45 @@ fn runPool(allocator: std.mem.Allocator, io: std.Io) !void {
     std.debug.print("[pool] live={d} idle={d} after re-acquire+release (should be 2/2)\n", .{ pool.liveCount(), pool.idleCount() });
     if (pool.liveCount() != 2) return error.PoolBookkeepingMismatch;
     std.debug.print("[pool] OK\n", .{});
+}
+
+fn runPoolLoop(allocator: std.mem.Allocator, io: std.Io) !void {
+    const pool = try clickzig.Pool.init(allocator, io, baseConfig(allocator), .{ .max_size = 2 });
+    defer pool.deinit();
+
+    var total: u64 = 0;
+    var iter: u64 = 0;
+    while (iter < 12) : (iter += 1) {
+        const client = try pool.acquire(null);
+        var arena: std.heap.ArenaAllocator = .init(allocator);
+        defer arena.deinit();
+
+        var params: clickzig.Parameters = .{};
+        defer params.deinit(arena.allocator());
+        try params.putUInt(arena.allocator(), "n", iter);
+        var stream = try client.query(
+            "SELECT {n:UInt64} + 1",
+            arena.allocator(),
+            null,
+            .{ .parameters = &params },
+        );
+        while (try stream.next()) |p| switch (p) {
+            .data => |b| {
+                if (b.num_rows != 0) total += b.columns[0].column.UInt64[0];
+            },
+            .end_of_stream => break,
+            .exception => |e| {
+                pool.release(client);
+                std.debug.print("[pool-loop] exception: {s}\n", .{e.message});
+                return error.QueryFailed;
+            },
+            else => {},
+        };
+        pool.release(client);
+    }
+    if (total != 78) return error.PoolLoopMismatch;
+    if (pool.liveCount() > 2 or pool.idleCount() > 2) return error.PoolBookkeepingMismatch;
+    std.debug.print("[pool-loop] OK total={d} live={d} idle={d}\n", .{ total, pool.liveCount(), pool.idleCount() });
 }
 
 fn runComplexTypes(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -490,7 +1034,7 @@ fn runNullableRoundtrip(allocator: std.mem.Allocator, io: std.Io) !void {
     std.debug.print("[nullable] OK: 5 rows with mixed null/non-null\n", .{});
 }
 
-fn runInsertCompression(allocator: std.mem.Allocator, io: std.Io) !void {
+fn runInsertCompression(allocator: std.mem.Allocator, io: std.Io, method: clickzig.compression.WriteMethod) !void {
     // Identical to runInsertRoundtrip but with compression enabled
     // end-to-end: Hello negotiates compression via per-query flag,
     // INSERT data block + terminator ride wrapped LZ4 frames, server's
@@ -501,6 +1045,7 @@ fn runInsertCompression(allocator: std.mem.Allocator, io: std.Io) !void {
     // assertion teeth.
     var cfg = baseConfig(allocator);
     cfg.compression = .Enable;
+    cfg.compression_method = method;
     const client = try clickzig.Client.connectTcp(cfg, io, null, null);
     defer client.close();
     var arena: std.heap.ArenaAllocator = .init(allocator);
@@ -510,21 +1055,26 @@ fn runInsertCompression(allocator: std.mem.Allocator, io: std.Io) !void {
     // effective_compression to .Enable; setting both makes the smoke's
     // intent obvious and surfaces a regression if either gate stops
     // working independently.
-    const compressed_opts: clickzig.query.QueryOptions = .{ .compression = .Enable };
+    const compressed_opts: clickzig.query.QueryOptions = .{ .compression = .Enable, .compression_method = method };
+    const label = if (method == .zstd) "insert-zstd" else "insert-compression";
+    const method_label = if (method == .zstd) "ZSTD" else "LZ4";
+    const table_name = if (method == .zstd) "smoke_insert_zstd" else "smoke_insert_compression";
 
     {
-        var s = try client.query("DROP TABLE IF EXISTS smoke_insert_compression", arena.allocator(), null, compressed_opts);
+        const sql = try std.fmt.allocPrint(arena.allocator(), "DROP TABLE IF EXISTS {s}", .{table_name});
+        var s = try client.query(sql, arena.allocator(), null, compressed_opts);
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
-            .exception => |e| { std.debug.print("[insert-compression] drop failed: {s}\n", .{e.message}); return error.SetupFailed; },
+            .exception => |e| { std.debug.print("[{s}] drop failed: {s}\n", .{ label, e.message }); return error.SetupFailed; },
             else => {},
         };
     }
     {
-        var s = try client.query("CREATE TABLE smoke_insert_compression (id UInt32, label String) ENGINE = Memory", arena.allocator(), null, compressed_opts);
+        const sql = try std.fmt.allocPrint(arena.allocator(), "CREATE TABLE {s} (id UInt32, label String) ENGINE = Memory", .{table_name});
+        var s = try client.query(sql, arena.allocator(), null, compressed_opts);
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
-            .exception => |e| { std.debug.print("[insert-compression] create failed: {s}\n", .{e.message}); return error.SetupFailed; },
+            .exception => |e| { std.debug.print("[{s}] create failed: {s}\n", .{ label, e.message }); return error.SetupFailed; },
             else => {},
         };
     }
@@ -541,8 +1091,9 @@ fn runInsertCompression(allocator: std.mem.Allocator, io: std.Io) !void {
         .{ .name = "id", .type_name = "UInt32", .data = .{ .UInt32 = &ids } },
         .{ .name = "label", .type_name = "String", .data = .{ .String = &labels } },
     };
+    const insert_sql = try std.fmt.allocPrint(arena.allocator(), "INSERT INTO {s} (id, label) FORMAT Native", .{table_name});
     try client.insert(
-        "INSERT INTO smoke_insert_compression (id, label) FORMAT Native",
+        insert_sql,
         "",
         100,
         &cols,
@@ -550,9 +1101,10 @@ fn runInsertCompression(allocator: std.mem.Allocator, io: std.Io) !void {
         null,
         compressed_opts,
     );
-    std.debug.print("[insert-compression] inserted 100 rows via LZ4 frames\n", .{});
+    std.debug.print("[{s}] inserted 100 rows via {s} frames\n", .{ label, method_label });
 
-    var s = try client.query("SELECT id, label FROM smoke_insert_compression ORDER BY id", arena.allocator(), null, compressed_opts);
+    const select_sql = try std.fmt.allocPrint(arena.allocator(), "SELECT id, label FROM {s} ORDER BY id", .{table_name});
+    var s = try client.query(select_sql, arena.allocator(), null, compressed_opts);
     var rows_seen: u32 = 0;
     while (try s.next()) |p| switch (p) {
         .data => |b| {
@@ -567,14 +1119,104 @@ fn runInsertCompression(allocator: std.mem.Allocator, io: std.Io) !void {
             rows_seen += @intCast(b.num_rows);
         },
         .end_of_stream => break,
-        .exception => |e| { std.debug.print("[insert-compression] select failed: {s}\n", .{e.message}); return error.QueryFailed; },
+        .exception => |e| { std.debug.print("[{s}] select failed: {s}\n", .{ label, e.message }); return error.QueryFailed; },
         else => {},
     };
     if (rows_seen != 100) {
-        std.debug.print("[insert-compression] FAIL: expected 100 rows, got {d}\n", .{rows_seen});
+        std.debug.print("[{s}] FAIL: expected 100 rows, got {d}\n", .{ label, rows_seen });
         return error.UnexpectedRowCount;
     }
-    std.debug.print("[insert-compression] OK: 100 rows round-tripped via LZ4 frames\n", .{});
+    std.debug.print("[{s}] OK: 100 rows round-tripped via {s} frames\n", .{ label, method_label });
+}
+
+fn runNestedCompressedInsert(allocator: std.mem.Allocator, io: std.Io) !void {
+    var cfg = baseConfig(allocator);
+    cfg.compression = .Enable;
+    cfg.compression_method = .zstd;
+    const client = try clickzig.Client.connectTcp(cfg, io, null, null);
+    defer client.close();
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+
+    const opts: clickzig.query.QueryOptions = .{ .compression = .Enable, .compression_method = .zstd };
+    {
+        var s = try client.query("DROP TABLE IF EXISTS smoke_nested_compressed", arena.allocator(), null, opts);
+        try drainNoException(&s, "nested-compressed-drop");
+    }
+    {
+        var s = try client.query(
+            \\CREATE TABLE smoke_nested_compressed (
+            \\    id UInt32,
+            \\    vals Array(Nullable(UInt32)),
+            \\    attrs Map(String, Nullable(UInt32))
+            \\) ENGINE = Memory
+        , arena.allocator(), null, opts);
+        try drainNoException(&s, "nested-compressed-create");
+    }
+
+    var ids = [_]u32{ 1, 2 };
+
+    var vals_offsets = [_]u64{ 3, 5 };
+    var vals_mask = [_]u8{ 0, 1, 0, 1, 0 };
+    var vals_inner_values = [_]u32{ 10, 0, 30, 0, 50 };
+    var vals_nullable: clickzig.column.Nullable = .{
+        .mask = &vals_mask,
+        .inner = .{ .UInt32 = &vals_inner_values },
+    };
+    var vals_array: clickzig.column.Array = .{
+        .offsets = &vals_offsets,
+        .inner = .{ .Nullable = &vals_nullable },
+    };
+
+    var attr_offsets = [_]u64{ 2, 3 };
+    var attr_keys = [_][]u8{ @constCast("a"), @constCast("b"), @constCast("c") };
+    var attr_mask = [_]u8{ 0, 1, 0 };
+    var attr_values_raw = [_]u32{ 100, 0, 300 };
+    var attr_values_nullable: clickzig.column.Nullable = .{
+        .mask = &attr_mask,
+        .inner = .{ .UInt32 = &attr_values_raw },
+    };
+    var attrs_map: clickzig.column.Map = .{
+        .offsets = &attr_offsets,
+        .keys = .{ .String = &attr_keys },
+        .values = .{ .Nullable = &attr_values_nullable },
+    };
+
+    const cols = [_]clickzig.block.InsertColumn{
+        .{ .name = "id", .type_name = "UInt32", .data = .{ .UInt32 = &ids } },
+        .{ .name = "vals", .type_name = "Array(Nullable(UInt32))", .data = .{ .Array = &vals_array } },
+        .{ .name = "attrs", .type_name = "Map(String, Nullable(UInt32))", .data = .{ .Map = &attrs_map } },
+    };
+    try client.insert(
+        "INSERT INTO smoke_nested_compressed (id, vals, attrs) FORMAT Native",
+        "",
+        2,
+        &cols,
+        arena.allocator(),
+        null,
+        opts,
+    );
+
+    var s = try client.query("SELECT id, vals, attrs FROM smoke_nested_compressed ORDER BY id", arena.allocator(), null, opts);
+    var rows: u64 = 0;
+    while (try s.next()) |p| switch (p) {
+        .data => |b| {
+            if (b.num_rows == 0) continue;
+            rows += b.num_rows;
+            const vals = b.columns[1].column.Array;
+            const attrs = b.columns[2].column.Map;
+            if (vals.offsets[0] != 3 or vals.offsets[1] != 5) return error.NestedCompressedMismatch;
+            if (vals.inner.Nullable.mask[1] != 1 or vals.inner.Nullable.inner.UInt32[4] != 50) return error.NestedCompressedMismatch;
+            if (attrs.offsets[0] != 2 or attrs.offsets[1] != 3) return error.NestedCompressedMismatch;
+            if (!std.mem.eql(u8, attrs.keys.String[2], "c")) return error.NestedCompressedMismatch;
+            if (attrs.values.Nullable.mask[1] != 1 or attrs.values.Nullable.inner.UInt32[2] != 300) return error.NestedCompressedMismatch;
+        },
+        .end_of_stream => break,
+        .exception => |e| { std.debug.print("[nested-compressed-insert] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        else => {},
+    };
+    if (rows != 2) return error.UnexpectedRowCount;
+    std.debug.print("[nested-compressed-insert] OK\n", .{});
 }
 
 fn runInsertRoundtrip(allocator: std.mem.Allocator, io: std.Io) !void {

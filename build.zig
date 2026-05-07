@@ -27,6 +27,19 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&run_tests.step);
 
+    const audit_module = b.createModule(.{
+        .root_source_file = b.path("tests/audit_probes.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    audit_module.addImport("clickzig", clickzig_module);
+    const audit_tests = b.addTest(.{
+        .root_module = audit_module,
+    });
+    const run_audit_tests = b.addRunArtifact(audit_tests);
+    const audit_step = b.step("audit", "Run security audit probes");
+    audit_step.dependOn(&run_audit_tests.step);
+
     // End-to-end smoke executable. Talks to a real ClickHouse on
     // localhost:9000. Pass the scenario name after a `--`:
     //   zig build smoke -- happy
@@ -44,6 +57,30 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_smoke.addArgs(args);
     const smoke_step = b.step("smoke", "Run smoke scenarios. Pass scenario via -- e.g. zig build smoke -- happy");
     smoke_step.dependOn(&run_smoke.step);
+
+    const smoke_compression_step = b.step("smoke-compression", "Run ClickHouse-backed compression smoke scenarios");
+    const run_smoke_select_compression = b.addRunArtifact(smoke);
+    run_smoke_select_compression.addArg("compression");
+    smoke_compression_step.dependOn(&run_smoke_select_compression.step);
+    const run_smoke_insert_compression = b.addRunArtifact(smoke);
+    run_smoke_insert_compression.addArg("insert-compression");
+    smoke_compression_step.dependOn(&run_smoke_insert_compression.step);
+    const run_smoke_insert_zstd = b.addRunArtifact(smoke);
+    run_smoke_insert_zstd.addArg("insert-zstd");
+    smoke_compression_step.dependOn(&run_smoke_insert_zstd.step);
+
+    const smoke_readiness_step = b.step("smoke-readiness", "Run ClickHouse-backed branch-readiness smoke scenarios");
+    const readiness_scenarios = [_][]const u8{
+        "pool", "pool-loop", "timeout", "read-timeout", "write-timeout",
+        "compression", "insert-compression", "insert-zstd", "nested-compressed-insert",
+        "lowcardinality", "lc-write", "json", "dynamic", "parameters",
+        "geo", "external-data", "combined-features", "column-coverage",
+    };
+    for (readiness_scenarios) |scenario| {
+        const run_readiness_smoke = b.addRunArtifact(smoke);
+        run_readiness_smoke.addArg(scenario);
+        smoke_readiness_step.dependOn(&run_readiness_smoke.step);
+    }
 
     // --- Examples ---
     // Each example is its own runnable: `zig build run-01-connect`,

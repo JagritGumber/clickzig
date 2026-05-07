@@ -172,7 +172,7 @@ pub fn readHelloResult(
         chunked_recv_srv = try wire.readStringOwned(reader, allocator, HELLO_STRING_MAX);
     }
 
-    // 54_461: password complexity rules. Read+discard for v0.16.0-alpha.
+    // 54_461: password complexity rules. Read+discard for v0.16.0.
     if (server_rev >= protocol.Revision.WITH_PASSWORD_COMPLEXITY_RULES) {
         const count = try varint.readVarUInt(reader, u64);
         if (count > PASSWORD_RULES_MAX) return error.UnexpectedPacket;

@@ -21,7 +21,7 @@ const std = @import("std");
 // Bumping this value requires implementing the additional packet fields
 // introduced between the old and new revisions.
 
-/// Pinned to 54_466 for v0.16.0-alpha — sits at a stable plateau before
+/// Pinned to 54_466 for v0.16.0 — sits at a stable plateau before
 /// chunked-packets (54_470), parallel-replicas (54_471), and addendum-required
 /// (54_458 — but addendum complexity grows past 54_470). Bumping requires
 /// implementing the additional packet fields introduced between revisions.

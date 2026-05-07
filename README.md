@@ -2,7 +2,8 @@
 
 A native-protocol ClickHouse client for Zig 0.16, designed for low-latency analytical and quant workloads.
 
-**Status: in development, approaching v0.16.0 tag.** All core paths land before the first tag — no incremental versions. Track `main` for progress.
+**Status: in development for Zig 0.16.0.** Track `main` for the current stable Zig line.
+Versioning follows the Karl Seguin-style Zig package convention: branches target Zig compiler lines, not a normal semver release train. Package metadata is pinned to Zig 0.16.0 (`build.zig.zon` + `.zigversion`). The `0.16.0` branch is the long-lived Zig 0.16 line; a future `dev` branch may track Zig development snapshots.
 
 ## what it is
 
@@ -19,6 +20,7 @@ clickzig speaks the ClickHouse native TCP protocol (port 9000 / 9440 TLS) direct
 
 **Queries + INSERT**
 - `Client.query()` returns a `ResultStream` iterator over server packets
+- Native ClickHouse query parameters via `{name:Type}` placeholders and `clickzig.Parameters`
 - Block decoder for SELECT responses (Data + Progress + ProfileInfo + ProfileEvents + Log + Totals + Extremes + TableColumns)
 - `Client.insert()` for bulk INSERT in Native format
 
@@ -28,10 +30,12 @@ clickzig speaks the ClickHouse native TCP protocol (port 9000 / 9440 TLS) direct
 - Aliases: Date, Date32, DateTime, DateTime64, Enum8, Enum16, IPv4, IPv6
 - Decimal(P, S) → Int32/Int64/Int128/Int256 based on precision (Decimal32/64/128/256 explicit aliases too)
 - LowCardinality(T) and LowCardinality(Nullable(T)) — read materializes to T; INSERT encodes a per-block dictionary on the fly (numeric, String, FixedString inner)
+- JSON, Dynamic, and Sparse(T) custom serialization coverage for the supported Native modes
 
 **Compression**
+- Opt-in compression via `Config.compression = .Enable` or per-query `QueryOptions.compression = .Enable`
 - LZ4 frames on both SELECT and INSERT (CityHash 1.0.2 frame checksum, vendored encoder + decoder)
-- ZSTD frames decoded on the read side via stdlib (no encoder yet)
+- ZSTD frames on read and write via stdlib/raw-block encoder
 
 **Pool + DSN**
 - `Pool` with thread-safe acquire/release, broken-discard, optional max-lifetime expiry
@@ -40,27 +44,29 @@ clickzig speaks the ClickHouse native TCP protocol (port 9000 / 9440 TLS) direct
 **TLS**
 - `TlsTransport` over `TcpTransport`, supports `.insecure` (dev) or `.system_ca` (production) verify modes
 
-## known gaps before v0.16.0
+## intentional non-goals for v0.16.0
 
-- **Sparse / Dynamic / JSON** — surface as `error.UnsupportedColumnType`. Decoders need polymorphic-variant support that doesn't fit the v0.16.0 column union; deferred.
 - **Async via `std.Io` fibers** — current API is sync. Iterator-first stream contract is locked so the column-store decoder doesn't fight the API later.
-- **Parameterised queries** — bindings via `?`/`{name:Type}` placeholders not yet implemented; all queries are raw text + Native blocks for INSERT data.
-- **ZSTD encoder** — read side decodes ZSTD frames; write side ships LZ4 only.
+- **SQL placeholder rewriting** — Go-style `?`, `$1`, and `@name` client-side rewriting is intentionally not implemented. Use native ClickHouse `{name:Type}` placeholders through `QueryOptions.parameters`.
 
 ## design decisions worth knowing up front
 
-- **Allocator split.** `Config.control_allocator` is long-lived (owns Client + ServerInfo + ServerError). A future `query_allocator` will be a per-query arena (resettable; O(1) free for ingest at 10M rows/sec).
-- **Transport interface, not concrete `Stream`.** `Client` holds a vtable. Built-in `TcpTransport` covers TCP/DNS; future `Io.Uring`, `Kqueue`, unix-domain socket, or test mocks drop in without touching Client code.
-- **Iterator-first query shape (locked, not yet implemented).** v0.17 `Client.query()` will return a `QueryStream` with `next() !?Block`. Decided now so the column-store decoder doesn't fight the API later.
+- **Allocator split.** `Config.control_allocator` is long-lived; query and insert calls accept a caller-owned allocator for per-query Blocks, ServerErrors, and scratch buffers.
+- **Transport interface, not concrete `Stream`.** `Client` holds a vtable. Built-in `TcpTransport` covers TCP/DNS; alternate backends or test mocks drop in without touching Client code.
+- **Iterator-first query shape.** `Client.query()` returns a `ResultStream` with `next() !?Packet`, so callers can stream Data, Progress, Log, Totals, Extremes, and Exception packets without buffering the full result.
 - **Lifecycle observability built in.** `Config.on_event` fires at every state transition (connecting, hello_sent, pong_received, ...). Default null = zero overhead. Layer metrics or OTel adapters on top without library changes.
-- **Single-thread per Client.** State machine is non-atomic by design. Use one Client per thread; a Pool wraps that in v0.17.
+- **Single-thread per Client.** State machine is non-atomic by design. Use one Client per thread or the built-in `Pool` for multi-threaded workloads.
 - **Cancellation via `*const std.atomic.Value(bool)`.** Polled at every I/O boundary in Client methods. Zig 0.16's `Future.cancel` is async-task-bound; for a sync API the atomic-bool is the right primitive.
 
 ## install
 
-Not installable yet — no tagged release. Once `v0.16.0` ships, the install snippet will land here.
+Not installable as a release yet. During development, depend on the branch that matches your Zig compiler:
 
-To preview from `main`, clone the repo and `@import("clickzig")` from a relative path or file URL.
+```bash
+zig fetch --save git+https://github.com/<owner>/clickzig#main
+```
+
+`main` targets Zig 0.16.0 today. Use the `0.16.0` branch for the maintained Zig 0.16 line. A future `dev` branch may target Zig development snapshots.
 
 ## quick start: query
 
@@ -112,6 +118,27 @@ try client.insert(
 );
 ```
 
+## quick start: parameters
+
+```zig
+var params: clickzig.Parameters = .{};
+defer params.deinit(arena.allocator());
+
+try params.putUInt(arena.allocator(), "n", 41);
+try params.putString(arena.allocator(), "label", "clickzig");
+try params.putDate(arena.allocator(), "day", "2026-05-07");
+
+var stream = try client.query(
+    "SELECT {n:UInt64} + 1, {label:String}, toDate({day:String})",
+    arena.allocator(),
+    null,
+    .{ .parameters = &params },
+);
+defer stream.deinit();
+```
+
+`QueryOptions.settings` remains separate from `QueryOptions.parameters`: settings change server execution behavior, while parameters feed ClickHouse native `{name:Type}` placeholders without SQL text interpolation. Parameter names must be ASCII identifiers such as `id`, `tenant_1`, or `_limit`; duplicate puts overwrite the old value in the map.
+
 ## quick start: pool
 
 ```zig
@@ -162,7 +189,9 @@ Connect errors are typed and granular. The OS-level cause flows into specific `C
 | `ConnectionRefused` | TCP connect refused |
 | `HostUnreachable` | no route to host |
 | `DnsFailure` | hostname did not resolve |
-| `ConnectTimeout` | dial exceeded `dial_timeout_ms` |
+| `ConnectTimeout` | TCP connect did not complete within `dial_timeout_ms` |
+| `ReadTimeout` | established socket read exceeded `read_timeout_ms` |
+| `WriteTimeout` | established socket write exceeded `write_timeout_ms` |
 | `ProtocolError` | malformed wire bytes (overlong varint, unexpected packet, length cap) |
 | `Cancelled` | caller's atomic bool flipped mid-handshake |
 | `ConnectionFailed` | catch-all for unmapped OS errors |
@@ -179,12 +208,20 @@ If you've used `clickhouse-go`, `clickhouse-rs` (klickhouse), or `clickhouse-cpp
 | `Array(T)` | `*Array { offsets, inner }` | row i = `inner[offsets[i-1] .. offsets[i]]` (offsets[-1] = 0) |
 | `Tuple(T1, T2, ...)` | `*Tuple { row_count, elements }` | `elements[k].<TypeTag>[i]` is the k-th element of row i |
 | `Map(K, V)` | `*Map { offsets, keys, values }` | wire layout = `Array(Tuple(K, V))`; pair-flat |
+| `Nested(x T, y U)` | `*Array { inner = Tuple(T, U) }` | ClickHouse alias for an array of named tuple fields |
 | `Decimal(P, S)` | `Int32` / `Int64` / `Int128` / `Int256` | scaled int; divide by `10^S` to recover the rational |
 | `IPv4` | `UInt32` | host order; format manually |
 | `IPv6` | `FixedString { width=16 }` | 16 raw bytes per row |
 | `UUID` | `[][16]u8` | 16 raw bytes per row, big-endian |
+| `DateTime64(...)` | `Int64` | signed fractional-second ticks |
+| `Interval*` | `Int64` | raw interval count |
+| `SimpleAggregateFunction(f, T)` | `T` | materialized as the underlying value type |
+| Geo aliases | existing Tuple/Array shapes | `Point`, `Ring`, `LineString`, `Polygon`, etc. expand to ClickHouse's tuple/array layout |
 | `LowCardinality(T)` | materialized `T` | dict + indexes is decoded transparently; you see plain T |
 | `LowCardinality(Nullable(T))` | materialized `*Nullable` | LC index 0 maps to `mask[i] = 1` |
+| `JSON` | `[][]u8` via `.JSON` | raw JSON text per row in Native JSON string mode |
+| `Dynamic` | `*Dynamic { type_names, discriminators, values }` | `0xff` discriminator means NULL |
+| `Sparse(T)` | materialized dense `T` where supported | sparse indexes are expanded into the existing column shape |
 
 **Allocation model.** Each `Block` owns its column buffers via the per-query allocator you passed to `client.query()`. Pass an arena and free in O(1) at end-of-query — clickzig deliberately does not pool buffers internally because that fights cancellation semantics.
 
@@ -204,13 +241,13 @@ zig build test
 zig build smoke -- <scenario>
 ```
 
-Scenarios: `happy`, `ping`, `wrong-pass`, `unreachable`, `wrong-host`, `query-bytes`, `query-mixed`, `insert-roundtrip`, `nullable-roundtrip`, `complex-types`, `tuple-map`, `decimal-ip`, `pool`, `dsn`, `compression`, `insert-compression`, `lowcardinality`, `lc-write`.
+Scenarios: `happy`, `ping`, `wrong-pass`, `unreachable`, `wrong-host`, `query-bytes`, `query-mixed`, `insert-roundtrip`, `nullable-roundtrip`, `complex-types`, `tuple-map`, `decimal-ip`, `column-coverage`, `pool`, `pool-loop`, `dsn`, `compression`, `insert-compression`, `insert-zstd`, `nested-compressed-insert`, `lowcardinality`, `lc-write`, `timeout`, `read-timeout`, `write-timeout`, `json`, `dynamic`, `parameters`, `geo`, `external-data`, `combined-features`.
 
 The smoke harness assumes `clickhouse/clickhouse-server:26.3` running locally with `default:test` credentials. CI runs every scenario against a service container on every push.
 
-### release pipeline
+### branch policy
 
-`.github/workflows/release.yml` is wired to fire on `v*` tag pushes. It gates on `zig build test` + `zig build examples` at the tagged commit, then creates a GitHub Release with auto-generated notes. Will fire once on `v0.16.0` when the package is feature-complete.
+`main` targets the latest supported stable Zig line for this repository: currently Zig 0.16.0. The `0.16.0` branch is the maintained Zig 0.16 line. A future `dev` branch may track Zig development snapshots. Do not create GitHub Releases or semver tag trains for normal development.
 
 ## license
 
