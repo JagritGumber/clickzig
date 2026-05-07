@@ -11,9 +11,9 @@
 //!        string(name)
 //!        string(type)
 //!        (gate WITH_CUSTOM_SERIALIZATION 54_454) u8 has_custom_serialization
-//!        — if has_custom_serialization != 0, a serialization-kind stack
-//!          follows. We don't support custom serialization yet (relevant
-//!          for Sparse, Dynamic, JSON columns); reject with ProtocolError.
+//!        — if has_custom_serialization != 0, column.zig handles the
+//!          supported custom serialization families (Sparse, Dynamic,
+//!          JSON) and rejects unknown custom payloads.
 //!        column data — handled by column.zig (raw LE for fixed-size,
 //!        per-row varint(len) + bytes for String).
 //!
@@ -27,6 +27,8 @@ const wire = @import("wire.zig");
 const varint = @import("varint.zig");
 const column_mod = @import("column.zig");
 const compression_mod = @import("compression.zig");
+
+pub const MAX_BLOCK_COLUMNS: u64 = 10_000;
 
 pub const BlockInfo = struct {
     is_overflows: bool = false,
@@ -62,15 +64,15 @@ pub const Block = struct {
 };
 
 pub const Error = error{
-    /// Server set has_custom_serialization on a column. Decoding the
-    /// serialization-kind stack isn't implemented yet (Sparse, Dynamic,
-    /// JSON columns trigger this).
+    /// Server set has_custom_serialization on a column whose custom
+    /// payload family is not implemented by column.zig.
     CustomSerializationUnsupported,
     /// BlockInfo carried a tag we don't recognise. Upstream defines
     /// 1=is_overflows, 2=bucket_num, 0=end. New tags would be a
     /// protocol bump that we haven't kept up with — refuse rather than
     /// silently misalign.
     UnknownBlockInfoTag,
+    BlockTooLarge,
 };
 
 /// One column to insert: name + ClickHouse type string + the column data.
@@ -135,7 +137,7 @@ pub fn writeBlockBody(
         try wire.writeStringBinary(writer, col.name);
         try wire.writeStringBinary(writer, col.type_name);
         if (server_revision >= protocol.Revision.WITH_CUSTOM_SERIALIZATION) {
-            try writer.writeByte(0); // we never emit custom-serialization columns
+            try writer.writeByte(@intFromBool(column_mod.hasCustomSerialization(col.type_name)));
         }
         try column_mod.writeColumnTyped(writer, allocator, col.type_name, col.data, num_rows);
     }
@@ -179,6 +181,8 @@ pub fn readBlockBody(
 
     const num_columns = try varint.readVarUInt(reader, u64);
     const num_rows = try varint.readVarUInt(reader, u64);
+    if (num_columns > MAX_BLOCK_COLUMNS) return error.BlockTooLarge;
+    if (num_rows > column_mod.MAX_COLUMN_ROWS) return error.BlockTooLarge;
 
     const columns = try allocator.alloc(ColumnEntry, @intCast(num_columns));
     errdefer allocator.free(columns);
@@ -196,12 +200,16 @@ pub fn readBlockBody(
         const col_type = try wire.readStringOwned(reader, allocator, wire.MAX_DEFAULT_STRING);
         errdefer allocator.free(col_type);
 
+        var has_custom = false;
         if (server_revision >= protocol.Revision.WITH_CUSTOM_SERIALIZATION) {
-            const has_custom = try reader.takeByte();
-            if (has_custom != 0) return error.CustomSerializationUnsupported;
+            const custom_byte = try reader.takeByte();
+            has_custom = custom_byte != 0;
         }
 
-        const col = try column_mod.readColumn(reader, allocator, col_type, num_rows);
+        const col = if (has_custom)
+            try column_mod.readCustomColumn(reader, allocator, col_type, num_rows)
+        else
+            try column_mod.readColumn(reader, allocator, col_type, num_rows);
         columns[col_i] = .{ .name = col_name, .type_name = col_type, .column = col };
         built = col_i + 1;
     }
@@ -318,7 +326,7 @@ test "writeBlock + readBlock round-trip a 2-col 3-row block" {
     try testing.expectEqualStrings("beta", block.columns[1].column.String[1]);
 }
 
-test "readBlock rejects custom_serialization byte != 0" {
+test "readBlock rejects unknown custom_serialization payload family" {
     var buf: [64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try wire.writeStringBinary(&w, "");
@@ -326,7 +334,7 @@ test "readBlock rejects custom_serialization byte != 0" {
     try varint.writeVarUInt(&w, 1);
     try varint.writeVarUInt(&w, 1);
     try wire.writeStringBinary(&w, "x");
-    try wire.writeStringBinary(&w, "Sparse(UInt8)");
+    try wire.writeStringBinary(&w, "NotACustomType");
     try w.writeByte(1); // has_custom_serialization = 1 → reject
 
     var r: std.Io.Reader = .fixed(w.buffered());

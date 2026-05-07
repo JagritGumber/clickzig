@@ -11,6 +11,15 @@ const std = @import("std");
 const wire = @import("wire.zig");
 const varint = @import("varint.zig");
 
+/// Defensive read-side caps for server-controlled block payloads.
+/// ClickHouse normally ships result blocks orders of magnitude smaller
+/// than these; the values are intentionally high enough for analytical
+/// use while preventing hostile length prefixes from becoming allocation
+/// requests in the GiB/TiB range.
+pub const MAX_COLUMN_ROWS: u64 = 10_000_000;
+pub const MAX_STRING_VALUE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_COLUMN_BYTES: usize = 1024 * 1024 * 1024;
+
 /// Identifies a primitive (non-wrapped) column type.
 pub const TypeId = enum {
     UInt8, UInt16, UInt32, UInt64, UInt128, UInt256,
@@ -58,6 +67,12 @@ pub const Column = union(enum) {
     /// cumulative offset table followed by interleaved key/value
     /// columns of total `offsets[N-1]` length each.
     Map: *Map,
+    /// JSON values carried through Native string serialization. Each row
+    /// is the raw JSON text for the value.
+    JSON: [][]u8,
+    /// Dynamic values preserve row discriminators and the nested columns
+    /// for concrete types present in the block.
+    Dynamic: *Dynamic,
 
     pub fn deinit(self: Column, allocator: std.mem.Allocator) void {
         switch (self) {
@@ -71,6 +86,11 @@ pub const Column = union(enum) {
             .UUID => |rows| allocator.free(rows),
             .Tuple => |t| t.deinit(allocator),
             .Map => |m| m.deinit(allocator),
+            .JSON => |rows| {
+                for (rows) |row| allocator.free(row);
+                allocator.free(rows);
+            },
+            .Dynamic => |d| d.deinit(allocator),
             inline else => |slice| allocator.free(slice),
         }
     }
@@ -82,6 +102,8 @@ pub const Column = union(enum) {
             .FixedString => |fs| if (fs.width == 0) 0 else fs.data.len / fs.width,
             .Tuple => |t| t.row_count,
             .Map => |m| m.offsets.len,
+            .JSON => |rows| rows.len,
+            .Dynamic => |d| d.discriminators.len,
             inline else => |slice| slice.len,
         };
     }
@@ -144,8 +166,26 @@ pub const Map = struct {
     }
 };
 
+pub const Dynamic = struct {
+    type_names: [][]u8,
+    discriminators: []u8,
+    values: []Column,
+
+    pub fn deinit(self: *Dynamic, allocator: std.mem.Allocator) void {
+        for (self.type_names) |name| allocator.free(name);
+        allocator.free(self.type_names);
+        allocator.free(self.discriminators);
+        for (self.values) |value| value.deinit(allocator);
+        allocator.free(self.values);
+        allocator.destroy(self);
+    }
+};
+
 pub const Error = error{
     UnsupportedColumnType,
+    ColumnTooLarge,
+    StringValueTooLarge,
+    InvalidArrayOffsets,
     /// Wire-format violation specific to LowCardinality: bad version,
     /// missing dictionary, malformed serialization_type, out-of-range
     /// index, or unknown index integer width. Distinct from
@@ -159,6 +199,8 @@ pub const Error = error{
     /// rejects the wire payload AFTER it lands and the connection ends
     /// up in `.broken` state with an opaque "wrong format" error.
     InsertColumnTypeMismatch,
+    CustomSerializationUnsupported,
+    CustomSerializationTooLarge,
 };
 
 /// LowCardinality(T) on-wire constants. Mirrors upstream
@@ -199,11 +241,13 @@ pub fn typeIdFromName(type_name: []const u8) ?TypeId {
     if (eq(u8, type_name, "Float32")) return .Float32;
     if (eq(u8, type_name, "Float64")) return .Float64;
     if (eq(u8, type_name, "String")) return .String;
+    if (eq(u8, type_name, "JSON") or startsWith(u8, type_name, "JSON(")) return .String;
     if (eq(u8, type_name, "Date")) return .UInt16;
-    // DateTime64(N, ...) is u64 (millisecond/microsecond/nanosecond ticks).
+    // DateTime64(N, ...) is i64 (signed fractional-second ticks).
     // DateTime(...) is u32 seconds-since-epoch.
-    if (startsWith(u8, type_name, "DateTime64")) return .UInt64;
+    if (startsWith(u8, type_name, "DateTime64")) return .Int64;
     if (startsWith(u8, type_name, "DateTime")) return .UInt32;
+    if (startsWith(u8, type_name, "Interval")) return .Int64;
     // Decimal aliases: scaled int. Caller multiplies by 10^scale to
     // recover the rational value. Decimal128/256(S) → underlying int.
     if (startsWith(u8, type_name, "Decimal32")) return .Int32;
@@ -235,8 +279,14 @@ pub fn readColumn(
     type_name: []const u8,
     num_rows: u64,
 ) !Column {
+    if (extractSimpleAggregateFunctionInner(type_name)) |inner| {
+        return readColumn(reader, allocator, inner, num_rows);
+    }
+    if (geoAliasExpansion(type_name)) |expanded| {
+        return readColumn(reader, allocator, expanded, num_rows);
+    }
+    const n_rows = try checkedRowCount(num_rows);
     if (extractNullableInner(type_name)) |inner_name| {
-        const n_rows: usize = @intCast(num_rows);
         const ptr = try allocator.create(Nullable);
         errdefer allocator.destroy(ptr);
         const mask = try allocator.alloc(u8, n_rows);
@@ -249,13 +299,13 @@ pub fn readColumn(
         return .{ .Nullable = ptr };
     }
     if (extractArrayInner(type_name)) |inner_name| {
-        const n_rows: usize = @intCast(num_rows);
         const ptr = try allocator.create(Array);
         errdefer allocator.destroy(ptr);
         const offsets = try allocator.alloc(u64, n_rows);
         errdefer allocator.free(offsets);
         try reader.readSliceAll(std.mem.sliceAsBytes(offsets));
         const total: u64 = if (n_rows == 0) 0 else offsets[n_rows - 1];
+        try validateOffsets(offsets, total);
         ptr.* = .{
             .offsets = offsets,
             .inner = try readColumn(reader, allocator, inner_name, total),
@@ -263,14 +313,13 @@ pub fn readColumn(
         return .{ .Array = ptr };
     }
     if (extractFixedStringWidth(type_name)) |width| {
-        const total = @as(usize, @intCast(num_rows)) * width;
+        const total = try checkedByteCount(n_rows, width);
         const data = try allocator.alloc(u8, total);
         errdefer allocator.free(data);
         try reader.readSliceAll(data);
         return .{ .FixedString = .{ .width = width, .data = data } };
     }
     if (std.mem.eql(u8, type_name, "UUID")) {
-        const n_rows: usize = @intCast(num_rows);
         const rows = try allocator.alloc([16]u8, n_rows);
         errdefer allocator.free(rows);
         try reader.readSliceAll(std.mem.sliceAsBytes(rows));
@@ -279,18 +328,21 @@ pub fn readColumn(
     if (extractMapKV(type_name)) |kv| {
         // Map(K, V) wire format = Array(Tuple(K, V)): one offsets table
         // covering both key and value columns; keys flat then values flat.
-        const n_rows: usize = @intCast(num_rows);
         const ptr = try allocator.create(Map);
         errdefer allocator.destroy(ptr);
         const offsets = try allocator.alloc(u64, n_rows);
         errdefer allocator.free(offsets);
         try reader.readSliceAll(std.mem.sliceAsBytes(offsets));
         const total: u64 = if (n_rows == 0) 0 else offsets[n_rows - 1];
+        try validateOffsets(offsets, total);
         const keys = try readColumn(reader, allocator, kv.key, total);
         errdefer keys.deinit(allocator);
         const values = try readColumn(reader, allocator, kv.value, total);
         ptr.* = .{ .offsets = offsets, .keys = keys, .values = values };
         return .{ .Map = ptr };
+    }
+    if (extractNestedArgs(type_name)) |args_str| {
+        return readNested(reader, allocator, args_str, num_rows);
     }
     if (extractLowCardinalityInner(type_name)) |inner_name| {
         return readLowCardinality(reader, allocator, inner_name, num_rows);
@@ -314,14 +366,14 @@ pub fn readColumn(
     }
     // IPv6 is canonically a 16-byte fixed-width column on the wire.
     if (std.mem.eql(u8, type_name, "IPv6")) {
-        const total = @as(usize, @intCast(num_rows)) * 16;
+        const total = try checkedByteCount(n_rows, 16);
         const data = try allocator.alloc(u8, total);
         errdefer allocator.free(data);
         try reader.readSliceAll(data);
         return .{ .FixedString = .{ .width = 16, .data = data } };
     }
     const tid = typeIdFromName(type_name) orelse return error.UnsupportedColumnType;
-    const n: usize = @intCast(num_rows);
+    const n = n_rows;
     return switch (tid) {
         .UInt8 => .{ .UInt8 = try readFixed(u8, reader, allocator, n) },
         .UInt16 => .{ .UInt16 = try readFixed(u16, reader, allocator, n) },
@@ -337,28 +389,159 @@ pub fn readColumn(
         .Int256 => .{ .Int256 = try readFixed(i256, reader, allocator, n) },
         .Float32 => .{ .Float32 = try readFixed(f32, reader, allocator, n) },
         .Float64 => .{ .Float64 = try readFixed(f64, reader, allocator, n) },
-        .String => blk: {
-            const rows = try allocator.alloc([]u8, n);
-            errdefer allocator.free(rows);
-            var i: usize = 0;
-            errdefer for (rows[0..i]) |r| allocator.free(r);
-            while (i < n) : (i += 1) {
-                const len_v = try varint.readVarUInt(reader, u64);
-                rows[i] = try reader.readAlloc(allocator, @intCast(len_v));
-            }
-            break :blk .{ .String = rows };
-        },
+        .String => .{ .String = try readStringRows(reader, allocator, n) },
     };
+}
+
+pub fn hasCustomSerialization(type_name: []const u8) bool {
+    return std.mem.eql(u8, type_name, "JSON")
+        or std.mem.startsWith(u8, type_name, "JSON(")
+        or std.mem.eql(u8, type_name, "Dynamic")
+        or extractSparseInner(type_name) != null;
+}
+
+pub fn readCustomColumn(
+    reader: *std.Io.Reader,
+    allocator: std.mem.Allocator,
+    type_name: []const u8,
+    num_rows: u64,
+) !Column {
+    if (std.mem.eql(u8, type_name, "JSON") or std.mem.startsWith(u8, type_name, "JSON(")) {
+        const version = try reader.takeInt(u64, .little);
+        if (version != 1) return error.CustomSerializationUnsupported;
+        return .{ .JSON = try readStringRows(reader, allocator, try checkedRowCount(num_rows)) };
+    }
+    if (std.mem.eql(u8, type_name, "Dynamic")) {
+        return readDynamic(reader, allocator, num_rows);
+    }
+    if (extractSparseInner(type_name)) |inner| {
+        return readSparseMaterialized(reader, allocator, inner, num_rows);
+    }
+    return error.CustomSerializationUnsupported;
+}
+
+fn readStringRows(reader: *std.Io.Reader, allocator: std.mem.Allocator, n: usize) ![][]u8 {
+    const rows = try allocator.alloc([]u8, n);
+    errdefer allocator.free(rows);
+    var i: usize = 0;
+    errdefer for (rows[0..i]) |r| allocator.free(r);
+    while (i < n) : (i += 1) {
+        const len_v = try varint.readVarUInt(reader, u64);
+        if (len_v > MAX_STRING_VALUE_BYTES) return error.StringValueTooLarge;
+        rows[i] = try reader.readAlloc(allocator, @intCast(len_v));
+    }
+    return rows;
+}
+
+fn readDynamic(reader: *std.Io.Reader, allocator: std.mem.Allocator, num_rows: u64) !Column {
+    const n_rows = try checkedRowCount(num_rows);
+    const version = try reader.takeInt(u64, .little);
+    if (version != 1) return error.CustomSerializationUnsupported;
+    const type_count_v = try varint.readVarUInt(reader, u64);
+    if (type_count_v > 256) return error.CustomSerializationTooLarge;
+    const type_count: usize = @intCast(type_count_v);
+
+    const dyn = try allocator.create(Dynamic);
+    errdefer allocator.destroy(dyn);
+    const type_names = try allocator.alloc([]u8, type_count);
+    errdefer allocator.free(type_names);
+    var names_built: usize = 0;
+    errdefer for (type_names[0..names_built]) |name| allocator.free(name);
+    while (names_built < type_count) : (names_built += 1) {
+        type_names[names_built] = try wire.readStringOwned(reader, allocator, wire.MAX_DEFAULT_STRING);
+    }
+
+    const discriminators = try allocator.alloc(u8, n_rows);
+    errdefer allocator.free(discriminators);
+    try reader.readSliceAll(discriminators);
+
+    const counts = try allocator.alloc(u64, type_count);
+    defer allocator.free(counts);
+    @memset(counts, 0);
+    for (discriminators) |d| {
+        if (d == 0xff) continue;
+        if (d >= type_count) return error.CustomSerializationUnsupported;
+        counts[d] += 1;
+    }
+
+    const values = try allocator.alloc(Column, type_count);
+    errdefer allocator.free(values);
+    var built: usize = 0;
+    errdefer for (values[0..built]) |value| value.deinit(allocator);
+    while (built < type_count) : (built += 1) {
+        values[built] = try readColumn(reader, allocator, type_names[built], counts[built]);
+    }
+    dyn.* = .{ .type_names = type_names, .discriminators = discriminators, .values = values };
+    return .{ .Dynamic = dyn };
+}
+
+fn readSparseMaterialized(reader: *std.Io.Reader, allocator: std.mem.Allocator, inner: []const u8, num_rows: u64) !Column {
+    const n_rows = try checkedRowCount(num_rows);
+    const non_default_v = try varint.readVarUInt(reader, u64);
+    if (non_default_v > num_rows) return error.CustomSerializationTooLarge;
+    const non_default: usize = @intCast(non_default_v);
+    const indexes = try allocator.alloc(u64, non_default);
+    defer allocator.free(indexes);
+    try reader.readSliceAll(std.mem.sliceAsBytes(indexes));
+    var prev: u64 = 0;
+    for (indexes, 0..) |idx, i| {
+        if (idx >= num_rows) return error.InvalidArrayOffsets;
+        if (i != 0 and idx <= prev) return error.InvalidArrayOffsets;
+        prev = idx;
+    }
+    const sparse_values = try readColumn(reader, allocator, inner, non_default);
+    defer sparse_values.deinit(allocator);
+    return materializeSparse(allocator, inner, n_rows, indexes, sparse_values);
+}
+
+fn materializeSparse(allocator: std.mem.Allocator, inner: []const u8, n_rows: usize, indexes: []const u64, sparse_values: Column) !Column {
+    if (typeIdFromName(inner)) |tid| switch (tid) {
+        .UInt8 => {
+            const dense = try allocator.alloc(u8, n_rows);
+            @memset(dense, 0);
+            for (indexes, 0..) |idx, i| dense[@intCast(idx)] = sparse_values.UInt8[i];
+            return .{ .UInt8 = dense };
+        },
+        .UInt32 => {
+            const dense = try allocator.alloc(u32, n_rows);
+            @memset(dense, 0);
+            for (indexes, 0..) |idx, i| dense[@intCast(idx)] = sparse_values.UInt32[i];
+            return .{ .UInt32 = dense };
+        },
+        else => {},
+    };
+    return error.CustomSerializationUnsupported;
 }
 
 /// Read `n` fixed-size little-endian values back-to-back. Assumes host
 /// endianness == little-endian (x86_64, aarch64); a big-endian host
 /// would need byte-swapping after the read.
 fn readFixed(comptime T: type, reader: *std.Io.Reader, allocator: std.mem.Allocator, n: usize) ![]T {
+    _ = try checkedByteCount(n, @sizeOf(T));
     const slice = try allocator.alloc(T, n);
     errdefer allocator.free(slice);
     try reader.readSliceAll(std.mem.sliceAsBytes(slice));
     return slice;
+}
+
+fn checkedRowCount(n: u64) Error!usize {
+    if (n > MAX_COLUMN_ROWS) return error.ColumnTooLarge;
+    if (n > std.math.maxInt(usize)) return error.ColumnTooLarge;
+    return @intCast(n);
+}
+
+fn checkedByteCount(count: usize, elem_size: usize) Error!usize {
+    if (elem_size != 0 and count > MAX_COLUMN_BYTES / elem_size) return error.ColumnTooLarge;
+    return count * elem_size;
+}
+
+fn validateOffsets(offsets: []const u64, total: u64) Error!void {
+    var prev: u64 = 0;
+    for (offsets) |offset| {
+        if (offset < prev) return error.InvalidArrayOffsets;
+        prev = offset;
+    }
+    _ = try checkedRowCount(total);
 }
 
 /// Type-aware column writer. Dispatches `LowCardinality(...)` to the
@@ -374,6 +557,18 @@ pub fn writeColumnTyped(
     col: Column,
     num_rows: u64,
 ) !void {
+    if (extractSimpleAggregateFunctionInner(type_name)) |_| {
+        return writeColumn(writer, col);
+    }
+    if (geoAliasExpansion(type_name)) |_| {
+        return writeColumn(writer, col);
+    }
+    if (extractNestedArgs(type_name)) |_| {
+        return writeColumn(writer, col);
+    }
+    if (hasCustomSerialization(type_name)) {
+        return writeCustomColumnTyped(writer, allocator, type_name, col, num_rows);
+    }
     if (extractLowCardinalityInner(type_name)) |inner_name| {
         return writeLowCardinality(writer, allocator, inner_name, col, num_rows);
     }
@@ -407,12 +602,54 @@ pub fn writeColumn(writer: *std.Io.Writer, col: Column) std.Io.Writer.Error!void
             try writeColumn(writer, m.keys);
             try writeColumn(writer, m.values);
         },
+        .JSON => |rows| {
+            for (rows) |row| try wire.writeStringBinary(writer, row);
+        },
+        .Dynamic => {},
         inline else => |slice| try writer.writeAll(std.mem.sliceAsBytes(slice)),
     }
 }
 
+pub fn writeCustomColumnTyped(
+    writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    type_name: []const u8,
+    col: Column,
+    num_rows: u64,
+) !void {
+    _ = allocator;
+    _ = num_rows;
+    if (std.mem.eql(u8, type_name, "JSON") or std.mem.startsWith(u8, type_name, "JSON(")) {
+        try writer.writeInt(u64, 1, .little);
+        switch (col) {
+            .JSON => |rows| for (rows) |row| try wire.writeStringBinary(writer, row),
+            .String => |rows| for (rows) |row| try wire.writeStringBinary(writer, row),
+            else => return error.InsertColumnTypeMismatch,
+        }
+        return;
+    }
+    return error.CustomSerializationUnsupported;
+}
+
 pub fn extractArrayInner(type_name: []const u8) ?[]const u8 {
     const prefix = "Array(";
+    if (!std.mem.startsWith(u8, type_name, prefix)) return null;
+    if (!std.mem.endsWith(u8, type_name, ")")) return null;
+    return type_name[prefix.len .. type_name.len - 1];
+}
+
+pub fn geoAliasExpansion(type_name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, type_name, "Point")) return "Tuple(Float64, Float64)";
+    if (std.mem.eql(u8, type_name, "Ring")) return "Array(Point)";
+    if (std.mem.eql(u8, type_name, "LineString")) return "Array(Point)";
+    if (std.mem.eql(u8, type_name, "MultiLineString")) return "Array(LineString)";
+    if (std.mem.eql(u8, type_name, "Polygon")) return "Array(Ring)";
+    if (std.mem.eql(u8, type_name, "MultiPolygon")) return "Array(Polygon)";
+    return null;
+}
+
+pub fn extractSparseInner(type_name: []const u8) ?[]const u8 {
+    const prefix = "Sparse(";
     if (!std.mem.startsWith(u8, type_name, prefix)) return null;
     if (!std.mem.endsWith(u8, type_name, ")")) return null;
     return type_name[prefix.len .. type_name.len - 1];
@@ -442,6 +679,82 @@ pub fn extractMapKV(type_name: []const u8) ?MapKV {
         }
     }
     return null;
+}
+
+pub fn extractSimpleAggregateFunctionInner(type_name: []const u8) ?[]const u8 {
+    const prefix = "SimpleAggregateFunction(";
+    if (!std.mem.startsWith(u8, type_name, prefix)) return null;
+    if (!std.mem.endsWith(u8, type_name, ")")) return null;
+    const inside = type_name[prefix.len .. type_name.len - 1];
+    var depth: u32 = 0;
+    var i: usize = 0;
+    while (i < inside.len) : (i += 1) {
+        switch (inside[i]) {
+            '(' => depth += 1,
+            ')' => {
+                if (depth > 0) depth -= 1;
+            },
+            ',' => if (depth == 0) return std.mem.trim(u8, inside[i + 1 ..], " "),
+            else => {},
+        }
+    }
+    return null;
+}
+
+pub fn extractNestedArgs(type_name: []const u8) ?[]const u8 {
+    const prefix = "Nested(";
+    if (!std.mem.startsWith(u8, type_name, prefix)) return null;
+    if (!std.mem.endsWith(u8, type_name, ")")) return null;
+    return type_name[prefix.len .. type_name.len - 1];
+}
+
+fn nestedFieldType(field_decl: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, field_decl, " ");
+    if (trimmed.len == 0) return null;
+    var depth: u32 = 0;
+    var i: usize = 0;
+    while (i < trimmed.len) : (i += 1) {
+        switch (trimmed[i]) {
+            '(' => depth += 1,
+            ')' => {
+                if (depth > 0) depth -= 1;
+            },
+            ' ', '\t', '\r', '\n' => if (depth == 0) {
+                return std.mem.trim(u8, trimmed[i + 1 ..], " ");
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn readNested(reader: *std.Io.Reader, allocator: std.mem.Allocator, args_str: []const u8, num_rows: u64) !Column {
+    const n_rows = try checkedRowCount(num_rows);
+    const ptr = try allocator.create(Array);
+    errdefer allocator.destroy(ptr);
+    const offsets = try allocator.alloc(u64, n_rows);
+    errdefer allocator.free(offsets);
+    try reader.readSliceAll(std.mem.sliceAsBytes(offsets));
+    const total: u64 = if (n_rows == 0) 0 else offsets[n_rows - 1];
+    try validateOffsets(offsets, total);
+
+    const tuple_ptr = try allocator.create(Tuple);
+    errdefer allocator.destroy(tuple_ptr);
+    var elements_list: std.ArrayListUnmanaged(Column) = .empty;
+    errdefer {
+        for (elements_list.items) |c| c.deinit(allocator);
+        elements_list.deinit(allocator);
+    }
+
+    var iter = topLevelTupleSplit(args_str);
+    while (iter.next()) |field_decl| {
+        const elem_type = nestedFieldType(field_decl) orelse return error.UnsupportedColumnType;
+        const elem = try readColumn(reader, allocator, elem_type, total);
+        try elements_list.append(allocator, elem);
+    }
+    tuple_ptr.* = .{ .row_count = total, .elements = try elements_list.toOwnedSlice(allocator) };
+    ptr.* = .{ .offsets = offsets, .inner = .{ .Tuple = tuple_ptr } };
+    return .{ .Array = ptr };
 }
 
 pub fn extractTupleArgs(type_name: []const u8) ?[]const u8 {
@@ -1070,6 +1383,21 @@ test "extractMapKV handles nested commas" {
     try testing.expectEqualStrings("Array(UInt32)", kv.value);
 }
 
+test "SimpleAggregateFunction peels value type" {
+    try testing.expectEqualStrings("UInt64", extractSimpleAggregateFunctionInner("SimpleAggregateFunction(sum, UInt64)").?);
+    try testing.expectEqualStrings("Nullable(UInt32)", extractSimpleAggregateFunctionInner("SimpleAggregateFunction(any, Nullable(UInt32))").?);
+    try testing.expectEqual(@as(?[]const u8, null), extractSimpleAggregateFunctionInner("AggregateFunction(sum, UInt64)"));
+}
+
+test "Nested field parser extracts field value types" {
+    const args = extractNestedArgs("Nested(x UInt32, y String, z Array(Nullable(Int8)))").?;
+    var it = topLevelTupleSplit(args);
+    try testing.expectEqualStrings("UInt32", nestedFieldType(it.next().?).?);
+    try testing.expectEqualStrings("String", nestedFieldType(it.next().?).?);
+    try testing.expectEqualStrings("Array(Nullable(Int8))", nestedFieldType(it.next().?).?);
+    try testing.expectEqual(@as(?[]const u8, null), it.next());
+}
+
 test "extractTupleArgs + topLevelTupleSplit" {
     const args = extractTupleArgs("Tuple(UInt8, String, Array(Int32))").?;
     var it = topLevelTupleSplit(args);
@@ -1077,6 +1405,101 @@ test "extractTupleArgs + topLevelTupleSplit" {
     try testing.expectEqualStrings("String", it.next().?);
     try testing.expectEqualStrings("Array(Int32)", it.next().?);
     try testing.expectEqual(@as(?[]const u8, null), it.next());
+}
+
+test "geo aliases expand to Native tuple/array shapes" {
+    try testing.expectEqualStrings("Tuple(Float64, Float64)", geoAliasExpansion("Point").?);
+    try testing.expectEqualStrings("Array(Point)", geoAliasExpansion("Ring").?);
+    try testing.expectEqualStrings("Array(Point)", geoAliasExpansion("LineString").?);
+    try testing.expectEqualStrings("Array(LineString)", geoAliasExpansion("MultiLineString").?);
+    try testing.expectEqualStrings("Array(Ring)", geoAliasExpansion("Polygon").?);
+    try testing.expectEqualStrings("Array(Polygon)", geoAliasExpansion("MultiPolygon").?);
+    try testing.expectEqual(@as(?[]const u8, null), geoAliasExpansion("Tuple(Float64, Float64)"));
+}
+
+test "Point alias round-trips as Tuple(Float64, Float64)" {
+    const ally = testing.allocator;
+    var xs = [_]f64{ 1.25, 3.5 };
+    var ys = [_]f64{ 2.75, 4.5 };
+    var elements = [_]Column{
+        .{ .Float64 = &xs },
+        .{ .Float64 = &ys },
+    };
+    var point_box: Tuple = .{ .row_count = 2, .elements = &elements };
+    const col_in: Column = .{ .Tuple = &point_box };
+
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeColumnTyped(&w, ally, "Point", col_in, 2);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col_out = try readColumn(&r, ally, "Point", 2);
+    defer col_out.deinit(ally);
+
+    try testing.expectEqual(@as(usize, 2), col_out.Tuple.elements.len);
+    try testing.expectEqualSlices(f64, &xs, col_out.Tuple.elements[0].Float64);
+    try testing.expectEqualSlices(f64, &ys, col_out.Tuple.elements[1].Float64);
+}
+
+test "DateTime64 maps to signed Int64 ticks" {
+    try testing.expectEqual(TypeId.Int64, typeIdFromName("DateTime64(3)").?);
+    var buf: [16]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var rows = [_]i64{ -315619200000, 0 };
+    try writeColumnTyped(&w, testing.allocator, "DateTime64(3)", .{ .Int64 = &rows }, 2);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col_out = try readColumn(&r, testing.allocator, "DateTime64(3)", 2);
+    defer col_out.deinit(testing.allocator);
+    try testing.expectEqualSlices(i64, &rows, col_out.Int64);
+}
+
+test "Nested round-trips as Array(Tuple(...))" {
+    const ally = testing.allocator;
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+
+    const offsets = [_]u64{ 2, 3 };
+    var ids = [_]u32{ 1, 2, 3 };
+    var names = [_][]u8{ @constCast("a"), @constCast("b"), @constCast("c") };
+    var elements = [_]Column{ .{ .UInt32 = &ids }, .{ .String = &names } };
+    var tuple_box: Tuple = .{ .row_count = 3, .elements = &elements };
+    var nested_box: Array = .{ .offsets = @constCast(&offsets), .inner = .{ .Tuple = &tuple_box } };
+
+    try writeColumnTyped(&w, ally, "Nested(id UInt32, name String)", .{ .Array = &nested_box }, 2);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col_out = try readColumn(&r, ally, "Nested(id UInt32, name String)", 2);
+    defer col_out.deinit(ally);
+
+    try testing.expectEqualSlices(u64, &offsets, col_out.Array.offsets);
+    try testing.expectEqualSlices(u32, &ids, col_out.Array.inner.Tuple.elements[0].UInt32);
+    try testing.expectEqualStrings("c", col_out.Array.inner.Tuple.elements[1].String[2]);
+}
+
+test "Ring alias round-trips as Array(Point)" {
+    const ally = testing.allocator;
+    var xs = [_]f64{ 0, 1, 1, 0 };
+    var ys = [_]f64{ 0, 0, 1, 1 };
+    var elements = [_]Column{
+        .{ .Float64 = &xs },
+        .{ .Float64 = &ys },
+    };
+    var tuple_box: Tuple = .{ .row_count = 4, .elements = &elements };
+    var offsets = [_]u64{4};
+    var ring_box: Array = .{
+        .offsets = &offsets,
+        .inner = .{ .Tuple = &tuple_box },
+    };
+    const col_in: Column = .{ .Array = &ring_box };
+
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeColumnTyped(&w, ally, "Ring", col_in, 1);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col_out = try readColumn(&r, ally, "Ring", 1);
+    defer col_out.deinit(ally);
+
+    try testing.expectEqualSlices(u64, &offsets, col_out.Array.offsets);
+    try testing.expectEqualSlices(f64, &xs, col_out.Array.inner.Tuple.elements[0].Float64);
+    try testing.expectEqualSlices(f64, &ys, col_out.Array.inner.Tuple.elements[1].Float64);
 }
 
 test "Tuple(UInt32, String) round-trips" {
@@ -1192,7 +1615,63 @@ test "readColumn String round-trips multibyte rows" {
 test "readColumn rejects unknown type" {
     var r: std.Io.Reader = .fixed(&[_]u8{});
     // Pick a column type genuinely outside v0.16.0's coverage.
-    try testing.expectError(error.UnsupportedColumnType, readColumn(&r, testing.allocator, "JSON", 0));
+    try testing.expectError(error.UnsupportedColumnType, readColumn(&r, testing.allocator, "DefinitelyNotAType", 0));
+}
+
+test "custom JSON string serialization decodes raw rows" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeInt(u64, 1, .little);
+    try wire.writeStringBinary(&w, "{\"a\":1}");
+    try wire.writeStringBinary(&w, "null");
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col = try readCustomColumn(&r, testing.allocator, "JSON", 2);
+    defer col.deinit(testing.allocator);
+    try testing.expectEqualStrings("{\"a\":1}", col.JSON[0]);
+    try testing.expectEqualStrings("null", col.JSON[1]);
+}
+
+test "custom Dynamic fixture decodes mixed scalar/null rows" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeInt(u64, 1, .little);
+    try varint.writeVarUInt(&w, 2);
+    try wire.writeStringBinary(&w, "UInt32");
+    try wire.writeStringBinary(&w, "String");
+    try w.writeAll(&.{ 0, 1, 0xff, 0 });
+    try w.writeAll(std.mem.sliceAsBytes(&[_]u32{ 10, 20 }));
+    try wire.writeStringBinary(&w, "x");
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col = try readCustomColumn(&r, testing.allocator, "Dynamic", 4);
+    defer col.deinit(testing.allocator);
+    try testing.expectEqualSlices(u8, &.{ 0, 1, 0xff, 0 }, col.Dynamic.discriminators);
+    try testing.expectEqualStrings("UInt32", col.Dynamic.type_names[0]);
+    try testing.expectEqual(@as(u32, 20), col.Dynamic.values[0].UInt32[1]);
+    try testing.expectEqualStrings("x", col.Dynamic.values[1].String[0]);
+}
+
+test "custom Sparse UInt8 materializes dense values" {
+    var buf: [128]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try varint.writeVarUInt(&w, 2);
+    try w.writeAll(std.mem.sliceAsBytes(&[_]u64{ 1, 3 }));
+    try w.writeAll(&.{ 9, 7 });
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    const col = try readCustomColumn(&r, testing.allocator, "Sparse(UInt8)", 5);
+    defer col.deinit(testing.allocator);
+    try testing.expectEqualSlices(u8, &.{ 0, 9, 0, 7, 0 }, col.UInt8);
+}
+
+test "custom serialization count cap trips before allocation" {
+    var buf: [16]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeInt(u64, 1, .little);
+    try varint.writeVarUInt(&w, 257);
+    var r: std.Io.Reader = .fixed(w.buffered());
+    try testing.expectError(error.CustomSerializationTooLarge, readCustomColumn(&r, testing.allocator, "Dynamic", 0));
 }
 
 test "extractLowCardinalityInner peels the wrapper" {
