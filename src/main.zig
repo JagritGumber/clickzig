@@ -1,8 +1,8 @@
 //! clickzig - native-protocol ClickHouse client for Zig 0.16+
 //!
-//! Status: v0.16.0-alpha. Sync TCP client targeting the ClickHouse
-//! native protocol (port 9000). Async via std.Io fibers planned for
-//! v0.17 alongside the query/insert API and connection pool.
+//! Status: v0.16.0. Sync TCP client targeting the ClickHouse
+//! native protocol (port 9000), with query streaming, Native INSERT,
+//! compression, pooling, TLS transport support, and DSN parsing.
 //!
 //! Usage sketch:
 //!   var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -27,6 +27,7 @@ pub const protocol = @import("protocol.zig");
 pub const client_info = @import("client_info.zig");
 pub const query = @import("query.zig");
 pub const settings = @import("settings.zig");
+pub const parameters = @import("parameters.zig");
 pub const column = @import("column.zig");
 pub const block = @import("block.zig");
 pub const result_stream = @import("result_stream.zig");
@@ -46,6 +47,9 @@ pub const ClientError = cherror.ClientError;
 pub const ServerError = cherror.ServerError;
 pub const ClientInfo = client_info.ClientInfo;
 pub const QueryOptions = query.QueryOptions;
+pub const ExternalTable = query.ExternalTable;
+pub const Parameters = parameters.Parameters;
+pub const ParameterMap = parameters.ParameterMap;
 pub const Block = block.Block;
 pub const Column = column.Column;
 pub const Packet = result_stream.Packet;
@@ -66,8 +70,8 @@ pub const Transport = transport_mod.Transport;
 pub const TcpTransport = transport_mod.TcpTransport;
 pub const TcpOptions = transport_mod.TcpOptions;
 
-/// Loose-typed settings map. Per-Client default attached on Config;
-/// per-query overrides land in v0.17 with the Query packet.
+/// Loose-typed settings map. Per-Client defaults attach on Config;
+/// per-query overrides attach on QueryOptions.
 pub const SettingsMap = std.StringHashMapUnmanaged([]const u8);
 
 pub const VERSION = "0.16.0";

@@ -1,17 +1,17 @@
 //! ClickHouse Client — owns a Transport, runs the Hello/Addendum
-//! handshake, exposes ping. Future query/insert paths layer on top.
+//! handshake, exposes ping, query streaming, and Native INSERT.
 //!
 //! Lifecycle (state machine, decision #7 of the locked plan):
 //!   .connecting   — TCP dial in progress (set by `connectTcp` only)
 //!   .handshaking  — Hello write, ServerHello read, Addendum write
 //!   .ready        — handshake complete, no in-flight operation
-//!   .busy         — an operation (ping / future query) is in flight
+//!   .busy         — an operation (ping / query / insert) is in flight
 //!   .broken       — an I/O or protocol error occurred; not reusable
 //!   .closed       — `close()` has been called; do not reuse
 //!
 //! Every error path inside Client methods MUST execute
 //! `self.is_broken = true; self.state = .broken;` before returning
-//! the error. This is the contract that lets a future Pool decide
+//! the error. This is the contract that lets Pool decide
 //! whether a returned connection is reusable. Audited per merge.
 //!
 //! `Client` is non-copyable (decision #12). Constructors return
@@ -24,8 +24,7 @@
 //! The protocol contract is "one connection serves one in-flight
 //! operation at a time" — concurrent calls from multiple threads on
 //! the same `Client` are undefined behaviour. For multi-threaded
-//! workloads, use one `Client` per thread (a connection pool wrapping
-//! per-thread Clients lands in v0.17).
+//! workloads, use one `Client` per thread or the built-in Pool.
 //!
 //! Cancellation note: `*const std.atomic.Value(bool)` is the right
 //! primitive for our sync API. Zig 0.16's `Future.cancel` is tied to
@@ -66,6 +65,8 @@ pub const Event = enum {
 pub const QueryError = error{
     ConnectionFailed,
     ProtocolError,
+    ReadTimeout,
+    WriteTimeout,
     Cancelled,
     OutOfMemory,
     ClientNotReady,
@@ -102,16 +103,13 @@ pub const ConnectError = error{
     /// Server returned an Exception during handshake that wasn't an
     /// auth failure. Inspect `Diagnostics.server_exception` for detail.
     ServerExceptionDuringHello,
-    /// Negotiated revision too old for this client (unused at v0.16,
-    /// reserved for the v0.17 query path).
+    /// Negotiated revision too old for this client.
     UnsupportedServerRevision,
     /// TCP `connect` did not complete before `dial_timeout_ms`.
     ConnectTimeout,
-    /// Read on an established socket exceeded `read_timeout_ms`. Not
-    /// yet enforced at the OS level — tracked for v0.17 per-op timeouts.
+    /// Read on an established socket exceeded `read_timeout_ms`.
     ReadTimeout,
-    /// Write on an established socket exceeded `write_timeout_ms`. Same
-    /// caveat as `ReadTimeout`.
+    /// Write on an established socket exceeded `write_timeout_ms`.
     WriteTimeout,
     /// Caller-provided cancellation token observed `true`.
     Cancelled,
@@ -140,28 +138,27 @@ pub const Config = struct {
     read_buffer_size: usize,
     write_buffer_size: usize,
 
-    /// Timeouts (ms). 0 = infinite (NOT recommended in prod). At
-    /// v0.16.0-alpha only `dial_timeout_ms` is enforced (by TcpTransport
-    /// at connect time). Read/write timeouts are stored on the
-    /// transport but not yet wired to per-op Io.Timeout — see v0.17.
+    /// Timeout budgets (ms). 0 = infinite. TcpTransport enforces dial,
+    /// read, and write timeout budgets without using std.Io.net's
+    /// still-panicking per-connect timeout flag.
     dial_timeout_ms: u32 = 30_000,
     read_timeout_ms: u32 = 60_000,
     write_timeout_ms: u32 = 30_000,
 
-    /// Forward field; used by future query path. Currently unused.
+    /// Per-client default settings forwarded by query/insert paths.
     settings: ?*const std.StringHashMapUnmanaged([]const u8) = null,
 
     /// Addendum capabilities. Defaults are safe (let server pick).
     proto_send_chunked: []const u8 = "notchunked_optional",
     proto_recv_chunked: []const u8 = "notchunked_optional",
 
-    /// Compression negotiation. Default is Disable; setting Enable
-    /// advertises LZ4 as the only supported codec (ZSTD encoder isn't
-    /// in 0.16's stdlib, so we negotiate LZ4 even though decompress
-    /// supports both). When enabled, every Data block sent or received
-    /// is wrapped in a compression frame (16-byte CityHash128 +
-    /// method + sizes + payload).
+    /// Compression is production-supported but opt-in. Default Disable
+    /// keeps compatibility conservative; setting Enable makes Data,
+    /// Totals, and Extremes block bodies use ClickHouse compression
+    /// frames. The client can write LZ4 or ZSTD frames and can read
+    /// LZ4 or ZSTD. Log/ProfileEvents compression remains revision-gated.
     compression: protocol.CompressionEnabled = .Disable,
+    compression_method: compression_mod.WriteMethod = .lz4,
 
     /// Observability hook. See decision #11+#15 for the contract:
     /// callback must NOT panic, allocate from control_allocator,
@@ -184,6 +181,7 @@ pub const Client = struct {
     /// Per-query default compression mode, copied from config at
     /// connect time. Per-call override on sendQuery/insert is allowed.
     compression: protocol.CompressionEnabled = .Disable,
+    compression_method: compression_mod.WriteMethod = .lz4,
 
     /// Connect over TCP using the built-in TcpTransport.
     pub fn connectTcp(
@@ -205,7 +203,6 @@ pub const Client = struct {
             config.control_allocator.destroy(tcp);
         }
 
-        // Stored on transport for future per-op enforcement (no-op today).
         tcp.transport().setReadTimeout(config.read_timeout_ms) catch {};
         tcp.transport().setWriteTimeout(config.write_timeout_ms) catch {};
 
@@ -238,6 +235,7 @@ pub const Client = struct {
             .connected_at_ms = now_ms,
             .last_used_at_ms = now_ms,
             .compression = config.compression,
+            .compression_method = config.compression_method,
         };
 
         if (cancellationRequested(cancel)) {
@@ -251,12 +249,12 @@ pub const Client = struct {
         hello.writeClientHello(transport.writer(), config.database, config.username, config.password, config.client_name) catch |e| {
             client.is_broken = true;
             client.state = .broken;
-            return mapWriteError(e);
+            return mapWriteError(transport, e);
         };
         transport.writer().flush() catch |e| {
             client.is_broken = true;
             client.state = .broken;
-            return mapWriteError(e);
+            return mapWriteError(transport, e);
         };
 
         if (cancellationRequested(cancel)) {
@@ -269,7 +267,7 @@ pub const Client = struct {
         const result = hello.readHelloResult(transport.reader(), config.control_allocator) catch |e| {
             client.is_broken = true;
             client.state = .broken;
-            return mapReadError(e);
+            return mapReadError(transport, e);
         };
         switch (result) {
             .ok => |info| client.server_info = info,
@@ -314,12 +312,12 @@ pub const Client = struct {
         }, negotiated) catch |e| {
             client.is_broken = true;
             client.state = .broken;
-            return mapWriteError(e);
+            return mapWriteError(transport, e);
         };
         transport.writer().flush() catch |e| {
             client.is_broken = true;
             client.state = .broken;
-            return mapWriteError(e);
+            return mapWriteError(transport, e);
         };
         emit(config, .addendum_sent);
 
@@ -366,12 +364,12 @@ pub const Client = struct {
         wire.writeClientPacketId(self.transport.writer(), .Ping) catch |e| {
             self.is_broken = true;
             self.state = .broken;
-            return mapWriteError(e);
+            return mapWriteError(self.transport, e);
         };
         self.transport.writer().flush() catch |e| {
             self.is_broken = true;
             self.state = .broken;
-            return mapWriteError(e);
+            return mapWriteError(self.transport, e);
         };
         emit(self.config, .ping_sent);
 
@@ -384,7 +382,7 @@ pub const Client = struct {
         const pkt = wire.readServerPacketId(self.transport.reader()) catch |e| {
             self.is_broken = true;
             self.state = .broken;
-            return mapReadError(e);
+            return mapReadError(self.transport, e);
         };
         if (pkt != .Pong) {
             self.is_broken = true;
@@ -397,20 +395,17 @@ pub const Client = struct {
     }
 
     /// True if this connection can serve another request. Consulted by
-    /// future Pool to decide whether to recycle or discard.
+    /// Pool to decide whether to recycle or discard.
     pub fn isReusable(self: *const Client) bool {
         return !self.is_broken and self.state == .ready;
     }
 
     /// Send a Query packet plus the empty Data terminator. Does NOT
-    /// drain the response — that's the next commit's job. Today's value
-    /// is purely "does the server accept our bytes without disconnecting"
-    /// so we can validate wire format end-to-end before building the
-    /// response decoder on top.
+    /// drain the response; callers use `query()` to get a ResultStream.
     ///
     /// State transition: .ready -> .busy. Caller must subsequently
-    /// drive the result-stream reader (also coming next commit) which
-    /// will land state back at .ready on EndOfStream.
+    /// drive the result-stream reader which lands state back at .ready
+    /// on EndOfStream.
     pub fn sendQuery(
         self: *Client,
         query_text: []const u8,
@@ -424,6 +419,7 @@ pub const Client = struct {
         // If caller didn't override, fall back to the client-wide setting.
         var opts = opts_in;
         if (opts.compression == .Disable and self.compression == .Enable) opts.compression = .Enable;
+        if (opts_in.compression_method == .lz4 and self.compression_method != .lz4) opts.compression_method = self.compression_method;
 
         const negotiated = self.server_info.negotiated(protocol.CLIENT_REVISION);
         const info: client_info_mod.ClientInfo = .{
@@ -434,37 +430,78 @@ pub const Client = struct {
         query_mod.writeClientQuery(self.transport.writer(), query_text, info, negotiated, opts) catch |e| {
             self.is_broken = true;
             self.state = .broken;
-            return mapWriteErrQuery(e);
-        };
-        // Empty Data terminator. When compression is on, wrap the
-        // BLOCK BODY (everything after the packet_id + table_name) in
-        // an LZ4 frame; the packet header itself stays uncompressed.
-        query_mod.writeDataPacketHeader(self.transport.writer(), "") catch |e| {
-            self.is_broken = true;
-            self.state = .broken;
-            return mapWriteErrQuery(e);
+            return mapWriteErrQuery(self.transport, e);
         };
         var body_alloc: std.heap.ArenaAllocator = .init(self.config.control_allocator);
         defer body_alloc.deinit();
-        var body_buf: std.Io.Writer.Allocating = .init(body_alloc.allocator());
+
+        for (opts.external_tables) |external| {
+            try self.sendDataBlock(external.name, external.num_rows, external.columns, negotiated, opts.compression, opts.compression_method, body_alloc.allocator());
+        }
+
+        try self.sendDataTerminator(negotiated, opts.compression, opts.compression_method, body_alloc.allocator());
+        self.transport.writer().flush() catch |e| {
+            self.is_broken = true;
+            self.state = .broken;
+            return mapWriteErrQuery(self.transport, e);
+        };
+        emit(self.config, .query_sent);
+        self.last_used_at_ms = std.Io.Clock.now(.real, self.io).toMilliseconds();
+    }
+
+    fn sendDataBlock(
+        self: *Client,
+        table_name: []const u8,
+        num_rows: u64,
+        columns: []const block_mod.InsertColumn,
+        negotiated: u64,
+        compression: protocol.CompressionEnabled,
+        compression_method: compression_mod.WriteMethod,
+        allocator: std.mem.Allocator,
+    ) QueryError!void {
+        query_mod.writeDataPacketHeader(self.transport.writer(), table_name) catch |e| {
+            self.is_broken = true;
+            self.state = .broken;
+            return mapWriteErrQuery(self.transport, e);
+        };
+        var body_buf: std.Io.Writer.Allocating = .init(allocator);
+        defer body_buf.deinit();
+        block_mod.writeBlockBody(&body_buf.writer, allocator, .{}, num_rows, columns, negotiated) catch |e| {
+            self.is_broken = true;
+            self.state = .broken;
+            return mapWriteErrQuery(self.transport, e);
+        };
+        compression_mod.writeMaybeCompressed(self.transport.writer(), allocator, body_buf.written(), compression, compression_method) catch |e| {
+            self.is_broken = true;
+            self.state = .broken;
+            return mapWriteErrQuery(self.transport, e);
+        };
+    }
+
+    fn sendDataTerminator(
+        self: *Client,
+        negotiated: u64,
+        compression: protocol.CompressionEnabled,
+        compression_method: compression_mod.WriteMethod,
+        allocator: std.mem.Allocator,
+    ) QueryError!void {
+        query_mod.writeDataPacketHeader(self.transport.writer(), "") catch |e| {
+            self.is_broken = true;
+            self.state = .broken;
+            return mapWriteErrQuery(self.transport, e);
+        };
+        var body_buf: std.Io.Writer.Allocating = .init(allocator);
         defer body_buf.deinit();
         query_mod.writeEmptyBlockBody(&body_buf.writer, negotiated) catch |e| {
             self.is_broken = true;
             self.state = .broken;
-            return mapWriteErrQuery(e);
+            return mapWriteErrQuery(self.transport, e);
         };
-        compression_mod.writeMaybeCompressed(self.transport.writer(), body_alloc.allocator(), body_buf.written(), opts.compression) catch |e| {
+        compression_mod.writeMaybeCompressed(self.transport.writer(), allocator, body_buf.written(), compression, compression_method) catch |e| {
             self.is_broken = true;
             self.state = .broken;
-            return mapWriteErrQuery(e);
+            return mapWriteErrQuery(self.transport, e);
         };
-        self.transport.writer().flush() catch |e| {
-            self.is_broken = true;
-            self.state = .broken;
-            return mapWriteErrQuery(e);
-        };
-        emit(self.config, .query_sent);
-        self.last_used_at_ms = std.Io.Clock.now(.real, self.io).toMilliseconds();
     }
 
     /// Send a query and return a `ResultStream` the caller iterates with
@@ -486,6 +523,7 @@ pub const Client = struct {
             .allocator = query_allocator,
             .server_revision = self.server_info.negotiated(protocol.CLIENT_REVISION),
             .compression = effective_compression,
+            .transport = self.transport,
             .client_state = .{
                 .state = self,
                 .is_broken = &self.is_broken,
@@ -516,6 +554,7 @@ pub const Client = struct {
         try self.sendQuery(query_text, cancel, opts);
         const negotiated = self.server_info.negotiated(protocol.CLIENT_REVISION);
         const effective_compression: protocol.CompressionEnabled = if (opts.compression == .Enable or self.compression == .Enable) .Enable else .Disable;
+        const effective_compression_method: compression_mod.WriteMethod = if (opts.compression_method != .lz4) opts.compression_method else self.compression_method;
         const log_pe_compression: protocol.CompressionEnabled = if (effective_compression == .Enable and negotiated >= protocol.Revision.WITH_COMPRESSED_LOGS_PROFILE_EVENTS_COLUMNS) .Enable else .Disable;
 
         // Drain the server's pre-data packets — at minimum the schema block
@@ -528,7 +567,7 @@ pub const Client = struct {
             const pkt = wire.readServerPacketId(self.transport.reader()) catch |e| {
                 self.is_broken = true;
                 self.state = .broken;
-                return mapReadErrQuery(e);
+                return mapReadErrQuery(self.transport, e);
             };
             switch (pkt) {
                 .Data => {
@@ -537,12 +576,12 @@ pub const Client = struct {
                     const tn = wire.readStringOwned(self.transport.reader(), query_allocator, wire.MAX_DEFAULT_STRING) catch |e| {
                         self.is_broken = true;
                         self.state = .broken;
-                        return mapReadErrQuery(e);
+                        return mapReadErrQuery(self.transport, e);
                     };
                     const block = block_mod.readMaybeCompressed(self.transport.reader(), query_allocator, negotiated, tn, effective_compression) catch |e| {
                         self.is_broken = true;
                         self.state = .broken;
-                        return mapReadErrQuery(e);
+                        return mapReadErrQuery(self.transport, e);
                     };
                     block.deinit();
                     schema_seen = true;
@@ -551,7 +590,7 @@ pub const Client = struct {
                     const exc = @import("exception.zig").readException(self.transport.reader(), query_allocator) catch |e| {
                         self.is_broken = true;
                         self.state = .broken;
-                        return mapReadErrQuery(e);
+                        return mapReadErrQuery(self.transport, e);
                     };
                     exc.deinit();
                     self.is_broken = true;
@@ -562,12 +601,12 @@ pub const Client = struct {
                     const tn = wire.readStringOwned(self.transport.reader(), query_allocator, wire.MAX_DEFAULT_STRING) catch |e| {
                         self.is_broken = true;
                         self.state = .broken;
-                        return mapReadErrQuery(e);
+                        return mapReadErrQuery(self.transport, e);
                     };
                     const blk = block_mod.readMaybeCompressed(self.transport.reader(), query_allocator, negotiated, tn, effective_compression) catch |e| {
                         self.is_broken = true;
                         self.state = .broken;
-                        return mapReadErrQuery(e);
+                        return mapReadErrQuery(self.transport, e);
                     };
                     blk.deinit();
                 },
@@ -575,12 +614,12 @@ pub const Client = struct {
                     const tn = wire.readStringOwned(self.transport.reader(), query_allocator, wire.MAX_DEFAULT_STRING) catch |e| {
                         self.is_broken = true;
                         self.state = .broken;
-                        return mapReadErrQuery(e);
+                        return mapReadErrQuery(self.transport, e);
                     };
                     const blk = block_mod.readMaybeCompressed(self.transport.reader(), query_allocator, negotiated, tn, log_pe_compression) catch |e| {
                         self.is_broken = true;
                         self.state = .broken;
-                        return mapReadErrQuery(e);
+                        return mapReadErrQuery(self.transport, e);
                     };
                     blk.deinit();
                 },
@@ -588,21 +627,21 @@ pub const Client = struct {
                     _ = result_stream_mod.ResultStream.readProgressBody(self.transport.reader(), negotiated) catch |e| {
                         self.is_broken = true;
                         self.state = .broken;
-                        return mapReadErrQuery(e);
+                        return mapReadErrQuery(self.transport, e);
                     };
                 },
                 .ProfileInfo => {
                     _ = result_stream_mod.ResultStream.readProfileInfoBody(self.transport.reader()) catch |e| {
                         self.is_broken = true;
                         self.state = .broken;
-                        return mapReadErrQuery(e);
+                        return mapReadErrQuery(self.transport, e);
                     };
                 },
                 .TableColumns => {
                     const tc = result_stream_mod.ResultStream.readTableColumnsBody(self.transport.reader(), query_allocator) catch |e| {
                         self.is_broken = true;
                         self.state = .broken;
-                        return mapReadErrQuery(e);
+                        return mapReadErrQuery(self.transport, e);
                     };
                     tc.deinit(query_allocator);
                 },
@@ -621,48 +660,48 @@ pub const Client = struct {
         wire.writeClientPacketId(self.transport.writer(), .Data) catch |e| {
             self.is_broken = true;
             self.state = .broken;
-            return mapWriteErrQuery(e);
+            return mapWriteErrQuery(self.transport, e);
         };
         wire.writeStringBinary(self.transport.writer(), table_name) catch |e| {
             self.is_broken = true;
             self.state = .broken;
-            return mapWriteErrQuery(e);
+            return mapWriteErrQuery(self.transport, e);
         };
         var body_buf: std.Io.Writer.Allocating = .init(query_allocator);
         defer body_buf.deinit();
         block_mod.writeBlockBody(&body_buf.writer, query_allocator, .{}, num_rows, columns, negotiated) catch |e| {
             self.is_broken = true;
             self.state = .broken;
-            return mapWriteErrQuery(e);
+            return mapWriteErrQuery(self.transport, e);
         };
-        compression_mod.writeMaybeCompressed(self.transport.writer(), query_allocator, body_buf.written(), effective_compression) catch |e| {
+        compression_mod.writeMaybeCompressed(self.transport.writer(), query_allocator, body_buf.written(), effective_compression, effective_compression_method) catch |e| {
             self.is_broken = true;
             self.state = .broken;
-            return mapWriteErrQuery(e);
+            return mapWriteErrQuery(self.transport, e);
         };
 
         // Empty terminator: header + body via the same helpers.
         query_mod.writeDataPacketHeader(self.transport.writer(), "") catch |e| {
             self.is_broken = true;
             self.state = .broken;
-            return mapWriteErrQuery(e);
+            return mapWriteErrQuery(self.transport, e);
         };
         var term_buf: std.Io.Writer.Allocating = .init(query_allocator);
         defer term_buf.deinit();
         query_mod.writeEmptyBlockBody(&term_buf.writer, negotiated) catch |e| {
             self.is_broken = true;
             self.state = .broken;
-            return mapWriteErrQuery(e);
+            return mapWriteErrQuery(self.transport, e);
         };
-        compression_mod.writeMaybeCompressed(self.transport.writer(), query_allocator, term_buf.written(), effective_compression) catch |e| {
+        compression_mod.writeMaybeCompressed(self.transport.writer(), query_allocator, term_buf.written(), effective_compression, effective_compression_method) catch |e| {
             self.is_broken = true;
             self.state = .broken;
-            return mapWriteErrQuery(e);
+            return mapWriteErrQuery(self.transport, e);
         };
         self.transport.writer().flush() catch |e| {
             self.is_broken = true;
             self.state = .broken;
-            return mapWriteErrQuery(e);
+            return mapWriteErrQuery(self.transport, e);
         };
 
         // Drain server response through EndOfStream via a temporary stream.
@@ -673,6 +712,7 @@ pub const Client = struct {
             .allocator = query_allocator,
             .server_revision = negotiated,
             .compression = effective_compression,
+            .transport = self.transport,
             .client_state = .{
                 .state = self,
                 .is_broken = &self.is_broken,
@@ -693,9 +733,11 @@ pub const Client = struct {
     }
 };
 
-fn mapReadErrQuery(e: anyerror) QueryError {
+fn mapReadErrQuery(transport: ?transport_mod.Transport, e: anyerror) QueryError {
+    if (readTimedOut(transport, e)) return error.ReadTimeout;
     return switch (e) {
         error.ReadFailed, error.EndOfStream => error.ConnectionFailed,
+        error.Timeout => error.ReadTimeout,
         error.OutOfMemory => error.OutOfMemory,
         error.Canceled, error.Cancelled => error.Cancelled,
         else => error.ProtocolError,
@@ -705,6 +747,7 @@ fn mapReadErrQuery(e: anyerror) QueryError {
 fn mapStreamErr(r: anytype) QueryError!@typeInfo(@TypeOf(r)).error_union.payload {
     return r catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
+        error.ReadTimeout => error.ReadTimeout,
         else => error.ProtocolError,
     };
 }
@@ -734,18 +777,22 @@ inline fn cancellationRequested(cancel: ?*const std.atomic.Value(bool)) bool {
     return false;
 }
 
-fn mapWriteError(e: anyerror) ConnectError {
+fn mapWriteError(transport: ?transport_mod.Transport, e: anyerror) ConnectError {
+    if (writeTimedOut(transport, e)) return error.WriteTimeout;
     return switch (e) {
         error.WriteFailed => error.ConnectionFailed,
+        error.Timeout => error.WriteTimeout,
         error.OutOfMemory => error.OutOfMemory,
         error.Canceled, error.Cancelled => error.Cancelled,
         else => error.ConnectionFailed,
     };
 }
 
-fn mapReadError(e: anyerror) ConnectError {
+fn mapReadError(transport: ?transport_mod.Transport, e: anyerror) ConnectError {
+    if (readTimedOut(transport, e)) return error.ReadTimeout;
     return switch (e) {
         error.ReadFailed, error.EndOfStream => error.ConnectionFailed,
+        error.Timeout => error.ReadTimeout,
         error.OutOfMemory => error.OutOfMemory,
         error.Canceled, error.Cancelled => error.Cancelled,
         error.OverlongVarint,
@@ -759,13 +806,31 @@ fn mapReadError(e: anyerror) ConnectError {
     };
 }
 
-fn mapWriteErrQuery(e: anyerror) QueryError {
+fn mapWriteErrQuery(transport: ?transport_mod.Transport, e: anyerror) QueryError {
+    if (writeTimedOut(transport, e)) return error.WriteTimeout;
     return switch (e) {
         error.WriteFailed => error.ConnectionFailed,
+        error.Timeout => error.WriteTimeout,
         error.OutOfMemory => error.OutOfMemory,
         error.Canceled, error.Cancelled => error.Cancelled,
         else => error.ConnectionFailed,
     };
+}
+
+fn readTimedOut(transport: ?transport_mod.Transport, e: anyerror) bool {
+    if (e == error.Timeout) return true;
+    if (e != error.ReadFailed) return false;
+    const t = transport orelse return false;
+    const err = t.lastReadError() orelse return false;
+    return err == error.Timeout;
+}
+
+fn writeTimedOut(transport: ?transport_mod.Transport, e: anyerror) bool {
+    if (e == error.Timeout) return true;
+    if (e != error.WriteFailed) return false;
+    const t = transport orelse return false;
+    const err = t.lastWriteError() orelse return false;
+    return err == error.Timeout;
 }
 
 fn mapTcpConnectError(e: transport_mod.ConnectError) ConnectError {
@@ -775,6 +840,7 @@ fn mapTcpConnectError(e: transport_mod.ConnectError) ConnectError {
         error.NetworkUnreachable => error.HostUnreachable,
         error.HostResolutionFailed, error.InvalidHost => error.DnsFailure,
         error.OutOfMemory => error.OutOfMemory,
+        error.ConcurrencyUnavailable => error.ConnectionFailed,
         error.Canceled => error.Cancelled,
     };
 }
@@ -808,10 +874,17 @@ test "isReusable false when broken" {
 }
 
 test "mapReadError categorizes protocol vs network failures" {
-    try testing.expectEqual(ConnectError.ConnectionFailed, mapReadError(error.EndOfStream));
-    try testing.expectEqual(ConnectError.ProtocolError, mapReadError(error.OverlongVarint));
-    try testing.expectEqual(ConnectError.ProtocolError, mapReadError(error.UnknownServerPacket));
-    try testing.expectEqual(ConnectError.OutOfMemory, mapReadError(error.OutOfMemory));
+    try testing.expectEqual(ConnectError.ConnectionFailed, mapReadError(null, error.EndOfStream));
+    try testing.expectEqual(ConnectError.ProtocolError, mapReadError(null, error.OverlongVarint));
+    try testing.expectEqual(ConnectError.ProtocolError, mapReadError(null, error.UnknownServerPacket));
+    try testing.expectEqual(ConnectError.OutOfMemory, mapReadError(null, error.OutOfMemory));
+    try testing.expectEqual(ConnectError.ReadTimeout, mapReadError(null, error.Timeout));
+}
+
+test "timeout errors map to public connect/read/write variants" {
+    try testing.expectEqual(ConnectError.ConnectTimeout, mapTcpConnectError(error.ConnectionTimeout));
+    try testing.expectEqual(ConnectError.ReadTimeout, mapReadError(null, error.Timeout));
+    try testing.expectEqual(ConnectError.WriteTimeout, mapWriteError(null, error.Timeout));
 }
 
 test "Event enum covers handshake + ping + close lifecycle" {
@@ -825,3 +898,4 @@ test "Event enum covers handshake + ping + close lifecycle" {
     };
     _ = _e;
 }
+

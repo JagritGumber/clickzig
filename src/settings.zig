@@ -35,6 +35,15 @@ pub fn writeSettings(
     writer: *std.Io.Writer,
     map: ?*const Map,
 ) std.Io.Writer.Error!void {
+    try writeSettingsEntries(writer, map);
+    // Sentinel: empty name terminates the sequence.
+    try wire.writeStringBinary(writer, "");
+}
+
+pub fn writeSettingsEntries(
+    writer: *std.Io.Writer,
+    map: ?*const Map,
+) std.Io.Writer.Error!void {
     if (map) |m| {
         var it = m.iterator();
         while (it.next()) |entry| {
@@ -43,8 +52,6 @@ pub fn writeSettings(
             try wire.writeStringBinary(writer, entry.value_ptr.*);
         }
     }
-    // Sentinel: empty name terminates the sequence.
-    try wire.writeStringBinary(writer, "");
 }
 
 const testing = std.testing;

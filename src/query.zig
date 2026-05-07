@@ -25,21 +25,38 @@ const wire = @import("wire.zig");
 const varint = @import("varint.zig");
 const client_info_mod = @import("client_info.zig");
 const settings_mod = @import("settings.zig");
+const parameters_mod = @import("parameters.zig");
+const block_mod = @import("block.zig");
+const compression_mod = @import("compression.zig");
+
+pub const Parameters = parameters_mod.Parameters;
+pub const ParameterMap = parameters_mod.ParameterMap;
+
+pub const ExternalTable = struct {
+    name: []const u8,
+    num_rows: u64,
+    columns: []const block_mod.InsertColumn,
+};
 
 pub const QueryOptions = struct {
     /// User-supplied query id, or empty to let the server auto-generate.
     query_id: []const u8 = "",
     /// How far to run the query before returning. Almost always .Complete.
     stage: protocol.QueryProcessingStage = .Complete,
-    /// Compression on the wire. Must agree with what was negotiated in
-    /// the Hello packet (we currently always send Disable; LZ4/ZSTD
-    /// land later in v0.16.0 once the codec is in).
+    /// Compression on the wire. Defaults to Disable; setting Enable
+    /// wraps Data block bodies in ClickHouse compression frames.
     compression: protocol.CompressionEnabled = .Disable,
+    /// Compression frame method used when `compression == .Enable`.
+    compression_method: compression_mod.WriteMethod = .lz4,
     /// Per-query settings overrides. Null = no overrides.
     settings: ?*const settings_mod.Map = null,
-    /// Substituted query parameters (Connection.cpp gates at 54_459).
-    /// Null = no parameters.
-    parameters: ?*const settings_mod.Map = null,
+    /// Native ClickHouse `{name:Type}` query parameters, emitted in
+    /// the WITH_PARAMETERS section. Null = no parameters.
+    parameters: ?*const parameters_mod.Parameters = null,
+    /// Named Native blocks sent after the Query packet and before the
+    /// empty Data terminator. Query text can read them as external
+    /// tables by `name`.
+    external_tables: []const ExternalTable = &.{},
 };
 
 pub fn writeClientQuery(
@@ -72,7 +89,7 @@ pub fn writeClientQuery(
 
     // Query parameters — gated. Empty map encodes to a single sentinel byte.
     if (server_revision >= protocol.Revision.WITH_PARAMETERS) {
-        try settings_mod.writeSettings(writer, opts.parameters);
+        try parameters_mod.writeParameters(writer, opts.parameters);
     }
 }
 
@@ -123,6 +140,45 @@ test "writeClientQuery emits Query packet ID first" {
     var w: std.Io.Writer = .fixed(&buf);
     try writeClientQuery(&w, "SELECT 1", .{}, protocol.CLIENT_REVISION, .{});
     try testing.expectEqual(@as(u8, @intFromEnum(protocol.ClientPacket.Query)), w.buffered()[0]);
+}
+
+test "writeClientQuery keeps settings and parameters separate" {
+    const ally = testing.allocator;
+    var settings: settings_mod.Map = .empty;
+    defer settings.deinit(ally);
+    try settings.put(ally, "max_threads", "1");
+
+    var params: Parameters = .{};
+    defer params.deinit(ally);
+    try params.putUInt(ally, "n", @as(u64, 41));
+
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeClientQuery(&w, "SELECT {n:UInt64}", .{}, protocol.CLIENT_REVISION, .{
+        .settings = &settings,
+        .parameters = &params,
+    });
+    const out = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "max_threads") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "SELECT {n:UInt64}") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "'41'") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "param_n") == null);
+}
+
+test "writeClientQuery omits protocol parameter section below WITH_PARAMETERS gate" {
+    const ally = testing.allocator;
+    var params: Parameters = .{};
+    defer params.deinit(ally);
+    try params.putUInt(ally, "n", @as(u64, 41));
+
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeClientQuery(&w, "SELECT {n:UInt64}", .{}, protocol.Revision.WITH_PARAMETERS - 1, .{
+        .parameters = &params,
+    });
+    const out = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "SELECT {n:UInt64}") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "'41'") == null);
 }
 
 test "writeEmptyDataTerminator at pinned revision emits the BlockInfo prelude" {
