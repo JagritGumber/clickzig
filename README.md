@@ -134,7 +134,6 @@ var stream = try client.query(
     null,
     .{ .parameters = &params },
 );
-defer stream.deinit();
 ```
 
 `QueryOptions.settings` remains separate from `QueryOptions.parameters`: settings change server execution behavior, while parameters feed ClickHouse native `{name:Type}` placeholders without SQL text interpolation. Parameter names must be ASCII identifiers such as `id`, `tenant_1`, or `_limit`; duplicate puts overwrite the old value in the map.
@@ -177,6 +176,16 @@ Five focused, copy-pasteable examples in `examples/`. Each demonstrates one conc
 | 05 | `05_custom_transport.zig` | plug a `MemTransport` (canned bytes) into `Client.fromTransport` | `zig build run-05-custom-transport` |
 
 `zig build examples` compiles all of them as a smoke check.
+
+## documentation
+
+The root README is the short overview. The full docs live in `docs/`:
+
+- [`docs/getting-started.md`](docs/getting-started.md) — install, connect, query, insert, parameters, compression, and checks
+- [`docs/api.md`](docs/api.md) — public API guide for `Config`, `Client`, `QueryOptions`, parameters, external tables, insert, pool, TLS, and DSN parsing
+- [`docs/types.md`](docs/types.md) — ClickHouse type mapping and `Column` shapes
+- [`docs/operations.md`](docs/operations.md) — smoke scenarios, CI gates, pooling, TLS, timeouts, and branch policy
+- [`docs/security.md`](docs/security.md) — defensive caps, timeout behavior, compression/frame security, and audit probes
 
 ## error handling
 

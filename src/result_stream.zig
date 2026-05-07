@@ -4,14 +4,13 @@
 //! sees `EndOfStream` (or `Exception`, which terminates as well).
 //! Callers iterate:
 //!
-//!     var stream = try client.query("SELECT 1", null, .{});
-//!     defer stream.deinit();
+//!     var stream = try client.query("SELECT 1", arena.allocator(), null, .{});
 //!     while (try stream.next()) |packet| {
 //!         switch (packet) {
-//!             .data => |block| { defer block.deinit(); ... },
+//!             .data => |block| { ... },
 //!             .progress => |p| { ... },
 //!             .end_of_stream => break,
-//!             .exception => |exc| { defer exc.deinit(); ... },
+//!             .exception => |exc| { ... },
 //!             else => {},
 //!         }
 //!     }
