@@ -2,14 +2,14 @@
 
 A native-protocol ClickHouse client for Zig 0.16, designed for low-latency analytical and quant workloads.
 
-**Status: in development for Zig 0.16.0.** Track `main` for the current stable Zig line.
+**Status: supported for Zig 0.16.0.** Track `main` for the current stable Zig line.
 Versioning follows the Karl Seguin-style Zig package convention: branches target Zig compiler lines, not a normal semver release train. Package metadata is pinned to Zig 0.16.0 (`build.zig.zon` + `.zigversion`). The `0.16.0` branch is the long-lived Zig 0.16 line; a future `dev` branch may track Zig development snapshots.
 
 ## what it is
 
 clickzig speaks the ClickHouse native TCP protocol (port 9000 / 9440 TLS) directly from Zig. Architecturally locked for predictable allocation, swap-able I/O backends, and explicit cancellation.
 
-## what works on `main` today
+## supported on `main`
 
 **Lifecycle**
 - Handshake against ClickHouse 26.x (ServerHello parsing through revision 54_466)
@@ -60,13 +60,13 @@ clickzig speaks the ClickHouse native TCP protocol (port 9000 / 9440 TLS) direct
 
 ## install
 
-Not installable as a release yet. During development, depend on the branch that matches your Zig compiler:
+Depend on the branch that matches your Zig compiler:
 
 ```bash
 zig fetch --save git+https://github.com/<owner>/clickzig#main
 ```
 
-`main` targets Zig 0.16.0 today. Use the `0.16.0` branch for the maintained Zig 0.16 line. A future `dev` branch may target Zig development snapshots.
+`main` targets Zig 0.16.0. Use the `0.16.0` branch for the maintained Zig 0.16 line. A future `dev` branch may target Zig development snapshots.
 
 ## quick start: query
 
