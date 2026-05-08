@@ -6,49 +6,35 @@
 
 <h1 align="center">clickzig</h1>
 
-A native-protocol ClickHouse client for Zig 0.16, designed for low-latency analytical and quant workloads.
+<h3 align="center">Native ClickHouse TCP for Zig 0.16.0</h3>
 
-**Status: supported for Zig 0.16.0.** Track `main` for the current stable Zig line.
+<p align="center">
+  Streaming queries, Native INSERT, compression, pooling, TLS, parameters, external data, and broad ClickHouse type coverage.
+</p>
+
+<p align="center">
+  <a href="https://github.com/JagritGumber/clickzig/actions/workflows/ci.yml"><img src="https://github.com/JagritGumber/clickzig/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/Zig-0.16.0-F7A41D?logo=zig&logoColor=white" alt="Zig 0.16.0">
+  <img src="https://img.shields.io/badge/ClickHouse-26.3%20tested-FFCC01?logo=clickhouse&logoColor=black" alt="ClickHouse 26.3 tested">
+  <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0">
+</p>
+
+## at a glance
+
+- ✅ **Supported for Zig 0.16.0** - `main` and `0.16.0` track the maintained Zig 0.16 line.
+- ⚡ **Native protocol** - talks ClickHouse TCP directly on `9000` or `9440` for TLS.
+- 📡 **Streaming queries** - `Client.query()` returns a `ResultStream` over Data, Progress, Logs, Totals, Extremes, Exceptions, and EndOfStream.
+- 📥 **Native INSERT** - bulk column-oriented INSERT with caller-owned buffers and explicit type names.
+- 🧩 **Parameters + settings** - native `{name:Type}` parameters stay separate from ClickHouse settings.
+- 📦 **External tables** - send named Native blocks alongside a query.
+- 🗜️ **Compression** - LZ4 and ZSTD read/write frames, opt-in by config or per query.
+- 🔐 **TLS + transports** - built-in TCP/TLS transports, plus a vtable for custom backends.
+- 🧵 **Pool** - thread-safe acquire/release with broken-connection discard and lifetime expiry.
+- 🧬 **Type coverage** - primitives, Nullable, Array, Tuple, Map, Decimal, LowCardinality, JSON, Dynamic, Sparse, Geo aliases, and common ClickHouse aliases.
+- 🛡️ **Security hardening** - allocation caps, timeout mapping, hostile-frame audit probes, and compression checksum validation.
+- 🧪 **CI-backed smoke tests** - live ClickHouse tests cover compression, parameters, external data, pool, timeouts, and combined scenarios.
+
 Versioning follows the Karl Seguin-style Zig package convention: branches target Zig compiler lines, not a normal semver release train. Package metadata is pinned to Zig 0.16.0 (`build.zig.zon` + `.zigversion`). The `0.16.0` branch is the long-lived Zig 0.16 line; a future `dev` branch may track Zig development snapshots.
-
-## what it is
-
-clickzig speaks the ClickHouse native TCP protocol (port 9000 / 9440 TLS) directly from Zig. Architecturally locked for predictable allocation, swap-able I/O backends, and explicit cancellation.
-
-## supported on `main`
-
-**Lifecycle**
-- Handshake against ClickHouse 26.x (ServerHello parsing through revision 54_466)
-- Ping / Pong liveness
-- Observability via `Config.on_event` (every state transition fires a callback)
-- Typed `ConnectError` with `Diagnostics` carrying parsed `ServerError`
-- Pluggable `Transport` (built-in `TcpTransport`, `TlsTransport`, or swap in your own)
-
-**Queries + INSERT**
-- `Client.query()` returns a `ResultStream` iterator over server packets
-- Native ClickHouse query parameters via `{name:Type}` placeholders and `clickzig.Parameters`
-- Block decoder for SELECT responses (Data + Progress + ProfileInfo + ProfileEvents + Log + Totals + Extremes + TableColumns)
-- `Client.insert()` for bulk INSERT in Native format
-
-**Column types**
-- Primitives: UInt8/16/32/64/128/256, Int8/16/32/64/128/256, Float32/64, String, Bool
-- Composite: Nullable(T), Array(T), FixedString(N), UUID, Tuple(...), Map(K, V)
-- Aliases: Date, Date32, DateTime, DateTime64, Enum8, Enum16, IPv4, IPv6
-- Decimal(P, S) → Int32/Int64/Int128/Int256 based on precision (Decimal32/64/128/256 explicit aliases too)
-- LowCardinality(T) and LowCardinality(Nullable(T)) — read materializes to T; INSERT encodes a per-block dictionary on the fly (numeric, String, FixedString inner)
-- JSON, Dynamic, and Sparse(T) custom serialization coverage for the supported Native modes
-
-**Compression**
-- Opt-in compression via `Config.compression = .Enable` or per-query `QueryOptions.compression = .Enable`
-- LZ4 frames on both SELECT and INSERT (CityHash 1.0.2 frame checksum, vendored encoder + decoder)
-- ZSTD frames on read and write via stdlib/raw-block encoder
-
-**Pool + DSN**
-- `Pool` with thread-safe acquire/release, broken-discard, optional max-lifetime expiry
-- `clickzig.fromUri("clickhouse://user:pw@host:port/db?key=val")` → Config
-
-**TLS**
-- `TlsTransport` over `TcpTransport`, supports `.insecure` (dev) or `.system_ca` (production) verify modes
 
 ## intentional non-goals for v0.16.0
 
