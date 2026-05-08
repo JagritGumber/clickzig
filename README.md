@@ -1,4 +1,10 @@
-# clickzig
+<p align="center">
+  <img src="https://cdn.simpleicons.org/clickhouse/FFCC01" alt="ClickHouse" height="56">
+  <span>&nbsp;&nbsp;&nbsp;</span>
+  <img src="https://cdn.simpleicons.org/zig/F7A41D" alt="Zig" height="56">
+</p>
+
+<h1 align="center">clickzig</h1>
 
 A native-protocol ClickHouse client for Zig 0.16, designed for low-latency analytical and quant workloads.
 
