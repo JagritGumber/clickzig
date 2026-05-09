@@ -1,7 +1,9 @@
 <p align="center">
-  <img src="https://cdn.simpleicons.org/clickhouse/FFCC01" alt="ClickHouse" height="86">
-  <span>&nbsp;&nbsp;&nbsp;<strong>+</strong>&nbsp;&nbsp;&nbsp;</span>
-  <img src="https://cdn.simpleicons.org/zig/F7A41D" alt="Zig" height="86">
+  <img src="https://cdn.simpleicons.org/clickhouse/FFCC01" alt="ClickHouse" height="86" align="middle">
+  &nbsp;&nbsp;&nbsp;
+  <img src="assets/plus.svg" alt="+" height="86" align="middle">
+  &nbsp;&nbsp;&nbsp;
+  <img src="https://cdn.simpleicons.org/zig/F7A41D" alt="Zig" height="86" align="middle">
 </p>
 
 <h1 align="center">clickzig</h1>
