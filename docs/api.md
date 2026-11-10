@@ -54,6 +54,7 @@ Important fields:
 | `dial_timeout_ms` | `30000` | TCP connect timeout; `0` means infinite |
 | `read_timeout_ms` | `60000` | socket read timeout; `0` means infinite |
 | `write_timeout_ms` | `30000` | socket write timeout; `0` means infinite |
+| `tcp_no_delay` | `true` | set `TCP_NODELAY` on the built-in TCP transport |
 | `cancel_drain_timeout_ms` | `5000` | read budget for draining the server after a canceled query sends `Cancel` |
 | `settings` | null | per-client default ClickHouse settings |
 | `compression` | `.Disable` | opt-in wire compression |

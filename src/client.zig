@@ -163,6 +163,10 @@ pub const Config = struct {
     /// query sends a protocol `Cancel` packet. If the server does not
     /// finish within this window the connection is marked broken.
     cancel_drain_timeout_ms: u32 = 5_000,
+    /// Disable Nagle's algorithm on the built-in TCP transport. Leave on
+    /// unless you have a specific reason: with Nagle, small trailing
+    /// packets stall on delayed ACKs (~40ms each).
+    tcp_no_delay: bool = true,
 
     /// Per-client default settings forwarded by query/insert paths.
     settings: ?*const std.StringHashMapUnmanaged([]const u8) = null,
@@ -214,6 +218,7 @@ pub const Client = struct {
             .read_buffer_size = config.read_buffer_size,
             .write_buffer_size = config.write_buffer_size,
             .dial_timeout_ms = config.dial_timeout_ms,
+            .no_delay = config.tcp_no_delay,
         }) catch |e| return mapTcpConnectError(e);
         errdefer {
             tcp.deinit();

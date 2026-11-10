@@ -26,6 +26,7 @@
 //! can map it to the public timeout variants.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 pub const Transport = struct {
@@ -75,6 +76,11 @@ pub const TcpOptions = struct {
     write_buffer_size: usize,
     /// Connect dial timeout. 0 = infinite (NOT recommended in prod).
     dial_timeout_ms: u32 = 30_000,
+    /// Set TCP_NODELAY. The native protocol is request/response with
+    /// small trailing packets (Data terminators, Ping, Cancel); with
+    /// Nagle enabled those wait on the peer's delayed ACK (~40ms on
+    /// Linux) after a large write, which caps INSERT at ~16 per second.
+    no_delay: bool = true,
 };
 
 pub const ConnectError = error{
@@ -123,6 +129,7 @@ pub const TcpTransport = struct {
 
         const stream = connectWithTimeout(io, host, port, opts.dial_timeout_ms) catch |e| return e;
         errdefer stream.close(io);
+        if (opts.no_delay) setNoDelay(stream);
 
         self.* = .{
             .allocator = allocator,
@@ -196,6 +203,24 @@ pub const TcpTransport = struct {
         return self.writer_state.err;
     }
 };
+
+/// Best effort: a failure only costs latency, never correctness.
+fn setNoDelay(stream: Io.net.Stream) void {
+    switch (builtin.os.tag) {
+        // std.posix.setsockopt is a compile error on Windows ("use
+        // std.Io instead") and std.Io has no socket-option API yet.
+        .windows, .wasi => return,
+        else => {
+            const one: c_int = 1;
+            std.posix.setsockopt(
+                stream.socket.handle,
+                std.posix.IPPROTO.TCP,
+                std.posix.TCP.NODELAY,
+                std.mem.asBytes(&one),
+            ) catch {};
+        },
+    }
+}
 
 const max_iovecs_len = 8;
 

@@ -194,7 +194,11 @@ fn runCancelRace(gpa: std.mem.Allocator, io: Io) !void {
         const client = try clickzig.Client.connectTcp(baseConfig(gpa), io, null);
         defer client.close();
         var task = try io.concurrent(shortQuery, .{ client, gpa });
-        if (delay > 0) try sleepMs(io, delay * 3);
+        if (delay > 0) {
+            // 250us steps: spans "canceled mid-query" through "already done".
+            const d: Io.Clock.Duration = .{ .raw = .fromNanoseconds(delay * 250_000), .clock = .awake };
+            try d.sleep(io);
+        }
         if (task.cancel(io)) |sum| {
             if (sum != 4499998500000) return error.WrongSum;
             completed += 1;
