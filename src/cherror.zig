@@ -32,8 +32,8 @@ pub const ClientError = error{
     TypeMismatch,
     /// Compression header bad, decompression failed, or checksum mismatch.
     CompressionError,
-    /// Operation cancelled by caller or by the Io runtime.
-    Cancelled,
+    /// Operation canceled through `std.Io` (Future/Group cancel).
+    Canceled,
     /// Authentication rejected (wrong user/password, db not permitted).
     AuthenticationFailed,
     /// Allocator returned OutOfMemory mid-decode. Re-exported so callers

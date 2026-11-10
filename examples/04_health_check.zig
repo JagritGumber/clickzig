@@ -1,43 +1,40 @@
-//! Example 04 — Health check loop with cancellation token.
+//! Example 04 — Health check loop with `std.Io` cancellation.
 //!
-//! Pings the server in a loop, sleeping 100ms between rounds. A
-//! background "supervisor" thread flips an atomic bool after 1.5s,
-//! demonstrating the cancellation contract: the cancel token is polled
-//! at every I/O boundary inside `ping`, so the loop exits within at
-//! most one in-flight operation.
+//! Runs a ping loop as an `Io` task (`io.concurrent`), then cancels it
+//! from `main` after 1.5s. Cancellation is delivered by the `Io`
+//! runtime: whichever operation the task is blocked in (the socket read
+//! waiting for Pong, or the 100ms sleep) returns `error.Canceled`, and
+//! clickzig propagates it unchanged.
 //!
 //! Concepts:
-//!   - `?*const std.atomic.Value(bool)` is the v0.16.0
-//!     cancellation primitive (a future major may switch to Io.Cancel).
-//!   - Polling cadence is documented per-operation in client.zig.
-//!   - `client.isReusable()` lets a future Pool decide whether to
-//!     recycle a connection or discard it after an error.
+//!   - No cancel token: `future.cancel(io)` is the cancellation primitive.
+//!   - The same code runs on `Io.Threaded` or an evented `Io`.
+//!   - `client.isReusable()` tells you whether the connection survived
+//!     (a ping canceled mid-flight leaves it broken; one canceled
+//!     during the sleep leaves it ready).
 
 const std = @import("std");
 const clickzig = @import("clickzig");
 
-const SupervisorArgs = struct {
-    cancel: *std.atomic.Value(bool),
-    io: std.Io,
-};
-
-fn supervisor(args: SupervisorArgs) void {
-    const ms_1500: std.Io.Clock.Duration = .{
-        .raw = .fromMilliseconds(1_500),
+fn healthLoop(client: *clickzig.Client, io: std.Io) clickzig.ConnectError!u32 {
+    const ms_100: std.Io.Clock.Duration = .{
+        .raw = .fromMilliseconds(100),
         .clock = .awake,
     };
-    ms_1500.sleep(args.io) catch return;
-    std.debug.print("[supervisor] requesting cancel\n", .{});
-    args.cancel.store(true, .release);
+    var pings: u32 = 0;
+    while (true) {
+        client.ping() catch |e| switch (e) {
+            error.Canceled => return pings,
+            else => return e,
+        };
+        pings += 1;
+        ms_100.sleep(io) catch return pings;
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
-
-    var cancel: std.atomic.Value(bool) = .init(false);
-    const sup = try std.Thread.spawn(.{}, supervisor, .{SupervisorArgs{ .cancel = &cancel, .io = io }});
-    defer sup.join();
 
     const client = try clickzig.Client.connectTcp(.{
         .control_allocator = allocator,
@@ -45,24 +42,18 @@ pub fn main(init: std.process.Init) !void {
         .write_buffer_size = 4 * 1024,
         .username = "default",
         .password = "test",
-    }, io, &cancel, null);
+    }, io, null);
     defer client.close();
 
-    const ms_100: std.Io.Clock.Duration = .{
-        .raw = .fromMilliseconds(100),
+    var task = try io.concurrent(healthLoop, .{ client, io });
+
+    const ms_1500: std.Io.Clock.Duration = .{
+        .raw = .fromMilliseconds(1_500),
         .clock = .awake,
     };
-    var i: u32 = 0;
-    while (true) : (i += 1) {
-        client.ping(&cancel) catch |e| switch (e) {
-            error.Cancelled => {
-                std.debug.print("[loop] cancelled after {d} pings\n", .{i});
-                break;
-            },
-            else => return e,
-        };
-        ms_100.sleep(io) catch break;
-    }
+    try ms_1500.sleep(io);
+    std.debug.print("[main] canceling health loop\n", .{});
 
-    std.debug.print("[loop] reusable={}, broken={}\n", .{ client.isReusable(), client.is_broken });
+    const pings = try task.cancel(io);
+    std.debug.print("[main] loop stopped after {d} pings; reusable={}\n", .{ pings, client.isReusable() });
 }

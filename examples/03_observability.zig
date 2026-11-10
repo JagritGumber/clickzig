@@ -40,11 +40,11 @@ pub fn main(init: std.process.Init) !void {
         .password = "test",
         .on_event = EventLog.observe,
         .on_event_ctx = &log,
-    }, io, null, null);
+    }, io, null);
     defer client.close();
 
-    try client.ping(null);
-    try client.ping(null);
+    try client.ping();
+    try client.ping();
 
     std.debug.print("\nfinal counts:\n", .{});
     var it = log.counts.iterator();

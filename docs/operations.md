@@ -113,7 +113,7 @@ const pool = try clickzig.Pool.init(allocator, io, cfg, .{
 });
 defer pool.deinit();
 
-const client = try pool.acquire(null);
+const client = try pool.acquire();
 defer pool.release(client);
 ```
 

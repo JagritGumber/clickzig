@@ -111,7 +111,7 @@ pub fn main(init: std.process.Init) !void {
         .control_allocator = allocator,
         .read_buffer_size = 4096,
         .write_buffer_size = 4096,
-    }, std.Io.Threaded.global_single_threaded.io(), mem.transport(), null, null);
+    }, std.Io.Threaded.global_single_threaded.io(), mem.transport(), null);
     defer client.close();
 
     std.debug.print("handshake against canned bytes complete\n", .{});

@@ -58,6 +58,21 @@ pub fn build(b: *std.Build) void {
     const smoke_step = b.step("smoke", "Run smoke scenarios. Pass scenario via -- e.g. zig build smoke -- happy");
     smoke_step.dependOn(&run_smoke.step);
 
+    const smoke_async_module = b.createModule(.{
+        .root_source_file = b.path("tests/smoke_async.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    smoke_async_module.addImport("clickzig", clickzig_module);
+    const smoke_async = b.addExecutable(.{
+        .name = "smoke_async",
+        .root_module = smoke_async_module,
+    });
+    const run_smoke_async = b.addRunArtifact(smoke_async);
+    run_smoke_async.addPassthruArgs();
+    const smoke_async_step = b.step("smoke-async", "Run async/cancellation smoke scenarios (default: all)");
+    smoke_async_step.dependOn(&run_smoke_async.step);
+
     const smoke_compression_step = b.step("smoke-compression", "Run ClickHouse-backed compression smoke scenarios");
     const run_smoke_select_compression = b.addRunArtifact(smoke);
     run_smoke_select_compression.addArg("compression");

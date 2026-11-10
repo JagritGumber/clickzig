@@ -102,7 +102,7 @@ fn drainNoException(stream: *clickzig.ResultStream, label: []const u8) !void {
 }
 
 fn runExternalData(allocator: std.mem.Allocator, io: std.Io) !void {
-    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null);
     defer client.close();
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -120,7 +120,6 @@ fn runExternalData(allocator: std.mem.Allocator, io: std.Io) !void {
     var stream = try client.query(
         "SELECT sum(x) AS total, count() AS n FROM ext_data WHERE label = 'keep'",
         arena.allocator(),
-        null,
         .{ .external_tables = &external },
     );
     var seen = false;
@@ -145,7 +144,7 @@ fn runExternalData(allocator: std.mem.Allocator, io: std.Io) !void {
 fn runCombinedFeatures(allocator: std.mem.Allocator, io: std.Io) !void {
     var cfg = baseConfig(allocator);
     cfg.compression = .Enable;
-    const client = try clickzig.Client.connectTcp(cfg, io, null, null);
+    const client = try clickzig.Client.connectTcp(cfg, io, null);
     defer client.close();
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -172,7 +171,6 @@ fn runCombinedFeatures(allocator: std.mem.Allocator, io: std.Io) !void {
     var stream = try client.query(
         "SELECT sum(x) AS total, count() AS n FROM combo_ext WHERE x > {min_x:UInt64} AND label = {wanted:String}",
         arena.allocator(),
-        null,
         .{ .compression = .Enable, .settings = &settings, .parameters = &params, .external_tables = &external },
     );
     var seen = false;
@@ -195,7 +193,7 @@ fn runCombinedFeatures(allocator: std.mem.Allocator, io: std.Io) !void {
 }
 
 fn runGeo(allocator: std.mem.Allocator, io: std.Io) !void {
-    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null);
     defer client.close();
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -208,7 +206,7 @@ fn runGeo(allocator: std.mem.Allocator, io: std.Io) !void {
         \\    CAST([[(0., 0.), (2., 2.)], [(3., 3.), (4., 4.)]], 'MultiLineString') AS multiline,
         \\    CAST([[(0., 0.), (1., 0.), (1., 1.)]], 'Polygon') AS poly,
         \\    CAST([[[(0., 0.), (1., 0.), (1., 1.)]]], 'MultiPolygon') AS multipoly
-    , arena.allocator(), null, .{});
+    , arena.allocator(), .{});
     var seen = false;
     while (try stream.next()) |p| switch (p) {
         .data => |b| {
@@ -250,7 +248,7 @@ fn runGeo(allocator: std.mem.Allocator, io: std.Io) !void {
     if (!seen) return error.UnexpectedRowCount;
 
     {
-        var s = try client.query("DROP TABLE IF EXISTS smoke_geo", arena.allocator(), null, .{});
+        var s = try client.query("DROP TABLE IF EXISTS smoke_geo", arena.allocator(), .{});
         try drainNoException(&s, "geo-drop");
     }
     {
@@ -263,7 +261,7 @@ fn runGeo(allocator: std.mem.Allocator, io: std.Io) !void {
             \\    poly Polygon,
             \\    multipoly MultiPolygon
             \\) ENGINE = Memory
-        , arena.allocator(), null, .{});
+        , arena.allocator(), .{});
         try drainNoException(&s, "geo-create");
     }
 
@@ -323,9 +321,9 @@ fn runGeo(allocator: std.mem.Allocator, io: std.Io) !void {
         .{ .name = "poly", .type_name = "Polygon", .data = .{ .Array = &poly_box } },
         .{ .name = "multipoly", .type_name = "MultiPolygon", .data = .{ .Array = &multipoly_box } },
     };
-    try client.insert("INSERT INTO smoke_geo (p, r, line, multiline, poly, multipoly) FORMAT Native", "", 1, &cols, arena.allocator(), null, .{});
+    try client.insert("INSERT INTO smoke_geo (p, r, line, multiline, poly, multipoly) FORMAT Native", "", 1, &cols, arena.allocator(), .{});
 
-    var back = try client.query("SELECT p, r, line, multiline, poly, multipoly FROM smoke_geo", arena.allocator(), null, .{});
+    var back = try client.query("SELECT p, r, line, multiline, poly, multipoly FROM smoke_geo", arena.allocator(), .{});
     var roundtrip_seen = false;
     while (try back.next()) |p| switch (p) {
         .data => |b| {
@@ -350,7 +348,7 @@ fn runGeo(allocator: std.mem.Allocator, io: std.Io) !void {
 }
 
 fn runParameters(allocator: std.mem.Allocator, io: std.Io) !void {
-    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null);
     defer client.close();
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -364,7 +362,6 @@ fn runParameters(allocator: std.mem.Allocator, io: std.Io) !void {
     var stream = try client.query(
         "SELECT {n:UInt64} + 1 AS answer, {s:String} AS label, toDate({d:String}) AS day",
         arena.allocator(),
-        null,
         .{ .parameters = &params },
     );
     var seen = false;
@@ -397,12 +394,12 @@ fn customTypeSettings(allocator: std.mem.Allocator) !clickzig.settings.Map {
 }
 
 fn runJson(allocator: std.mem.Allocator, io: std.Io) !void {
-    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null);
     defer client.close();
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
     var settings = try customTypeSettings(arena.allocator());
-    var s = try client.query("SELECT toJSONString(CAST('{\"a\":1}' AS JSON)) AS j", arena.allocator(), null, .{ .settings = &settings });
+    var s = try client.query("SELECT toJSONString(CAST('{\"a\":1}' AS JSON)) AS j", arena.allocator(), .{ .settings = &settings });
     var seen = false;
     while (try s.next()) |p| switch (p) {
         .data => |b| {
@@ -432,12 +429,12 @@ fn runJson(allocator: std.mem.Allocator, io: std.Io) !void {
 }
 
 fn runDynamic(allocator: std.mem.Allocator, io: std.Io) !void {
-    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null);
     defer client.close();
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
     var settings = try customTypeSettings(arena.allocator());
-    var s = try client.query("SELECT toString(CAST(number AS Dynamic)) AS d FROM numbers(2)", arena.allocator(), null, .{ .settings = &settings });
+    var s = try client.query("SELECT toString(CAST(number AS Dynamic)) AS d FROM numbers(2)", arena.allocator(), .{ .settings = &settings });
     var rows: u64 = 0;
     while (try s.next()) |p| switch (p) {
         .data => |b| {
@@ -470,7 +467,7 @@ fn runTimeout(allocator: std.mem.Allocator, io: std.Io) !void {
     }
     cfg.dial_timeout_ms = 50;
     const started = std.Io.Clock.now(.awake, io);
-    const result = clickzig.Client.connectTcp(cfg, io, null, null);
+    const result = clickzig.Client.connectTcp(cfg, io, null);
     if (result) |c| {
         c.close();
         return error.UnexpectedSuccess;
@@ -493,7 +490,7 @@ fn runReadTimeout(allocator: std.mem.Allocator, io: std.Io) !void {
     cfg.read_timeout_ms = 50;
 
     const started = std.Io.Clock.now(.awake, io);
-    const result = clickzig.Client.connectTcp(cfg, io, null, null);
+    const result = clickzig.Client.connectTcp(cfg, io, null);
     if (result) |client| {
         client.close();
         return error.UnexpectedSuccess;
@@ -553,13 +550,13 @@ fn runLowCardinalityWrite(allocator: std.mem.Allocator, io: std.Io) !void {
     // INSERT through the client (which now encodes LC frames), SELECT
     // back, and verify exact match. Round-trips both the read AND write
     // sides of the LC implementation against a real server.
-    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null);
     defer client.close();
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
 
     {
-        var s = try client.query("DROP TABLE IF EXISTS smoke_lc_w", arena.allocator(), null, .{});
+        var s = try client.query("DROP TABLE IF EXISTS smoke_lc_w", arena.allocator(), .{});
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
             .exception => |e| {
@@ -581,7 +578,7 @@ fn runLowCardinalityWrite(allocator: std.mem.Allocator, io: std.Io) !void {
             \\    label LowCardinality(String),
             \\    note LowCardinality(Nullable(String))
             \\) ENGINE = Memory
-        , arena.allocator(), null, .{});
+        , arena.allocator(), .{});
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
             .exception => |e| {
@@ -625,12 +622,11 @@ fn runLowCardinalityWrite(allocator: std.mem.Allocator, io: std.Io) !void {
         6,
         &cols,
         arena.allocator(),
-        null,
         .{ .query_id = "smoke-lc-write" },
     );
     std.debug.print("[lc-write] inserted 6 rows via LC encoder\n", .{});
 
-    var s = try client.query("SELECT k, label, note FROM smoke_lc_w ORDER BY k", arena.allocator(), null, .{});
+    var s = try client.query("SELECT k, label, note FROM smoke_lc_w ORDER BY k", arena.allocator(), .{});
     var seen: u32 = 0;
     while (try s.next()) |p| switch (p) {
         .data => |b| {
@@ -668,13 +664,13 @@ fn runLowCardinality(allocator: std.mem.Allocator, io: std.Io) !void {
     // INSERT...SELECT (we don't ship client-side LC encoding yet),
     // then SELECT and verify the materialized data matches the
     // pattern we generated server-side.
-    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null);
     defer client.close();
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
 
     {
-        var s = try client.query("DROP TABLE IF EXISTS smoke_lc", arena.allocator(), null, .{});
+        var s = try client.query("DROP TABLE IF EXISTS smoke_lc", arena.allocator(), .{});
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
             .exception => |e| {
@@ -691,7 +687,7 @@ fn runLowCardinality(allocator: std.mem.Allocator, io: std.Io) !void {
             \\    v LowCardinality(String),
             \\    m LowCardinality(Nullable(String))
             \\) ENGINE = Memory
-        , arena.allocator(), null, .{});
+        , arena.allocator(), .{});
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
             .exception => |e| {
@@ -709,7 +705,7 @@ fn runLowCardinality(allocator: std.mem.Allocator, io: std.Io) !void {
             \\    ['alpha', 'beta', 'gamma'][(number % 3) + 1] AS v,
             \\    if(number % 4 = 0, NULL, ['x', 'y', 'z'][(number % 3) + 1]) AS m
             \\FROM numbers(20)
-        , arena.allocator(), null, .{});
+        , arena.allocator(), .{});
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
             .exception => |e| {
@@ -720,7 +716,7 @@ fn runLowCardinality(allocator: std.mem.Allocator, io: std.Io) !void {
         };
     }
 
-    var s = try client.query("SELECT k, v, m FROM smoke_lc ORDER BY k", arena.allocator(), null, .{});
+    var s = try client.query("SELECT k, v, m FROM smoke_lc ORDER BY k", arena.allocator(), .{});
     var seen: u32 = 0;
     var nulls: u32 = 0;
     while (try s.next()) |p| switch (p) {
@@ -765,7 +761,7 @@ fn runCompression(allocator: std.mem.Allocator, io: std.Io) !void {
     // wrapped in LZ4 compression frames; we decompress and parse.
     var cfg = baseConfig(allocator);
     cfg.compression = .Enable;
-    const client = try clickzig.Client.connectTcp(cfg, io, null, null);
+    const client = try clickzig.Client.connectTcp(cfg, io, null);
     defer client.close();
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -773,7 +769,6 @@ fn runCompression(allocator: std.mem.Allocator, io: std.Io) !void {
     var s = try client.query(
         "SELECT number FROM numbers(100)",
         arena.allocator(),
-        null,
         .{ .compression = .Enable },
     );
     var rows: u64 = 0;
@@ -799,7 +794,7 @@ fn runCompression(allocator: std.mem.Allocator, io: std.Io) !void {
 }
 
 fn runTupleMap(allocator: std.mem.Allocator, io: std.Io) !void {
-    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null);
     defer client.close();
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -808,7 +803,7 @@ fn runTupleMap(allocator: std.mem.Allocator, io: std.Io) !void {
         \\    (number, toString(number * 10)) AS pair,
         \\    map('a', toInt64(1), 'b', toInt64(number)) AS m
         \\FROM numbers(2)
-    , arena.allocator(), null, .{});
+    , arena.allocator(), .{});
     var rows: u64 = 0;
     while (try s.next()) |p| switch (p) {
         .data => |b| {
@@ -841,7 +836,7 @@ fn runTupleMap(allocator: std.mem.Allocator, io: std.Io) !void {
 }
 
 fn runDecimalIp(allocator: std.mem.Allocator, io: std.Io) !void {
-    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null);
     defer client.close();
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -851,7 +846,7 @@ fn runDecimalIp(allocator: std.mem.Allocator, io: std.Io) !void {
         \\    toIPv4('192.168.1.1') AS v4,
         \\    toIPv6('2001:db8::1') AS v6,
         \\    toUInt128(toUInt64(0xFFFF) * toUInt64(0x10001)) AS big
-    , arena.allocator(), null, .{});
+    , arena.allocator(), .{});
     while (try s.next()) |p| switch (p) {
         .data => |b| {
             if (b.num_rows == 0) continue;
@@ -875,7 +870,7 @@ fn runDecimalIp(allocator: std.mem.Allocator, io: std.Io) !void {
 }
 
 fn runColumnCoverage(allocator: std.mem.Allocator, io: std.Io) !void {
-    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null);
     defer client.close();
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -886,7 +881,7 @@ fn runColumnCoverage(allocator: std.mem.Allocator, io: std.Io) !void {
         \\    CAST(42, 'SimpleAggregateFunction(sum, UInt64)') AS saf,
         \\    CAST([(1, 'a'), (2, 'b')], 'Nested(id UInt32, name String)') AS nested_col,
         \\    toIntervalDay(3) AS interval_day
-    , arena.allocator(), null, .{});
+    , arena.allocator(), .{});
     var seen = false;
     while (try s.next()) |p| switch (p) {
         .data => |b| {
@@ -927,9 +922,9 @@ fn runDsn(allocator: std.mem.Allocator, io: std.Io) !void {
             .write_buffer_size = 4 * 1024,
         },
     );
-    const client = try clickzig.Client.connectTcp(result.config, io, null, null);
+    const client = try clickzig.Client.connectTcp(result.config, io, null);
     defer client.close();
-    try client.ping(null);
+    try client.ping();
     std.debug.print("[dsn] connected via DSN; client_name={s}\n", .{result.config.client_name.?});
     std.debug.print("[dsn] OK\n", .{});
 }
@@ -941,18 +936,18 @@ fn runPool(allocator: std.mem.Allocator, io: std.Io) !void {
     // Acquire 3 distinct clients in parallel-ish (no real threads needed
     // for the smoke; just sequential acquire+ping+release with a peek
     // at live_count to confirm pool bookkeeping).
-    const c1 = try pool.acquire(null);
-    try c1.ping(null);
-    const c2 = try pool.acquire(null);
-    try c2.ping(null);
+    const c1 = try pool.acquire();
+    try c1.ping();
+    const c2 = try pool.acquire();
+    try c2.ping();
     std.debug.print("[pool] live={d} idle={d} after 2 acquires\n", .{ pool.liveCount(), pool.idleCount() });
     pool.release(c1);
     pool.release(c2);
     std.debug.print("[pool] live={d} idle={d} after release\n", .{ pool.liveCount(), pool.idleCount() });
 
     // Re-acquire — should hit the idle slot, no new dial.
-    const c3 = try pool.acquire(null);
-    try c3.ping(null);
+    const c3 = try pool.acquire();
+    try c3.ping();
     pool.release(c3);
     std.debug.print("[pool] live={d} idle={d} after re-acquire+release (should be 2/2)\n", .{ pool.liveCount(), pool.idleCount() });
     if (pool.liveCount() != 2) return error.PoolBookkeepingMismatch;
@@ -966,7 +961,7 @@ fn runPoolLoop(allocator: std.mem.Allocator, io: std.Io) !void {
     var total: u64 = 0;
     var iter: u64 = 0;
     while (iter < 12) : (iter += 1) {
-        const client = try pool.acquire(null);
+        const client = try pool.acquire();
         var arena: std.heap.ArenaAllocator = .init(allocator);
         defer arena.deinit();
 
@@ -976,7 +971,6 @@ fn runPoolLoop(allocator: std.mem.Allocator, io: std.Io) !void {
         var stream = try client.query(
             "SELECT {n:UInt64} + 1",
             arena.allocator(),
-            null,
             .{ .parameters = &params },
         );
         while (try stream.next()) |p| switch (p) {
@@ -1000,7 +994,7 @@ fn runPoolLoop(allocator: std.mem.Allocator, io: std.Io) !void {
 
 fn runComplexTypes(allocator: std.mem.Allocator, io: std.Io) !void {
     // Hit Array, FixedString, and UUID in one query against the server.
-    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null);
     defer client.close();
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -1011,7 +1005,7 @@ fn runComplexTypes(allocator: std.mem.Allocator, io: std.Io) !void {
         \\    toFixedString(toString(number), 4) AS fs,
         \\    generateUUIDv4() AS id
         \\FROM numbers(2)
-    , arena.allocator(), null, .{});
+    , arena.allocator(), .{});
     var rows: u64 = 0;
     while (try s.next()) |p| switch (p) {
         .data => |b| {
@@ -1048,7 +1042,7 @@ fn runComplexTypes(allocator: std.mem.Allocator, io: std.Io) !void {
 fn runNullableRoundtrip(allocator: std.mem.Allocator, io: std.Io) !void {
     // Read a server-generated Nullable column and verify the mask comes
     // through. Bypasses INSERT to keep the test scope focused on read.
-    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null);
     defer client.close();
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -1058,7 +1052,7 @@ fn runNullableRoundtrip(allocator: std.mem.Allocator, io: std.Io) !void {
         \\    number AS n,
         \\    if(number % 2 = 0, NULL, toUInt32(number * 10)) AS maybe_n
         \\FROM numbers(5)
-    , arena.allocator(), null, .{});
+    , arena.allocator(), .{});
     var rows_seen: u64 = 0;
     while (try s.next()) |p| switch (p) {
         .data => |b| {
@@ -1103,7 +1097,7 @@ fn runInsertCompression(allocator: std.mem.Allocator, io: std.Io, method: clickz
     var cfg = baseConfig(allocator);
     cfg.compression = .Enable;
     cfg.compression_method = method;
-    const client = try clickzig.Client.connectTcp(cfg, io, null, null);
+    const client = try clickzig.Client.connectTcp(cfg, io, null);
     defer client.close();
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -1119,7 +1113,7 @@ fn runInsertCompression(allocator: std.mem.Allocator, io: std.Io, method: clickz
 
     {
         const sql = try std.fmt.allocPrint(arena.allocator(), "DROP TABLE IF EXISTS {s}", .{table_name});
-        var s = try client.query(sql, arena.allocator(), null, compressed_opts);
+        var s = try client.query(sql, arena.allocator(), compressed_opts);
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
             .exception => |e| {
@@ -1131,7 +1125,7 @@ fn runInsertCompression(allocator: std.mem.Allocator, io: std.Io, method: clickz
     }
     {
         const sql = try std.fmt.allocPrint(arena.allocator(), "CREATE TABLE {s} (id UInt32, label String) ENGINE = Memory", .{table_name});
-        var s = try client.query(sql, arena.allocator(), null, compressed_opts);
+        var s = try client.query(sql, arena.allocator(), compressed_opts);
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
             .exception => |e| {
@@ -1161,13 +1155,12 @@ fn runInsertCompression(allocator: std.mem.Allocator, io: std.Io, method: clickz
         100,
         &cols,
         arena.allocator(),
-        null,
         compressed_opts,
     );
     std.debug.print("[{s}] inserted 100 rows via {s} frames\n", .{ label, method_label });
 
     const select_sql = try std.fmt.allocPrint(arena.allocator(), "SELECT id, label FROM {s} ORDER BY id", .{table_name});
-    var s = try client.query(select_sql, arena.allocator(), null, compressed_opts);
+    var s = try client.query(select_sql, arena.allocator(), compressed_opts);
     var rows_seen: u32 = 0;
     while (try s.next()) |p| switch (p) {
         .data => |b| {
@@ -1199,14 +1192,14 @@ fn runNestedCompressedInsert(allocator: std.mem.Allocator, io: std.Io) !void {
     var cfg = baseConfig(allocator);
     cfg.compression = .Enable;
     cfg.compression_method = .zstd;
-    const client = try clickzig.Client.connectTcp(cfg, io, null, null);
+    const client = try clickzig.Client.connectTcp(cfg, io, null);
     defer client.close();
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
 
     const opts: clickzig.query.QueryOptions = .{ .compression = .Enable, .compression_method = .zstd };
     {
-        var s = try client.query("DROP TABLE IF EXISTS smoke_nested_compressed", arena.allocator(), null, opts);
+        var s = try client.query("DROP TABLE IF EXISTS smoke_nested_compressed", arena.allocator(), opts);
         try drainNoException(&s, "nested-compressed-drop");
     }
     {
@@ -1216,7 +1209,7 @@ fn runNestedCompressedInsert(allocator: std.mem.Allocator, io: std.Io) !void {
             \\    vals Array(Nullable(UInt32)),
             \\    attrs Map(String, Nullable(UInt32))
             \\) ENGINE = Memory
-        , arena.allocator(), null, opts);
+        , arena.allocator(), opts);
         try drainNoException(&s, "nested-compressed-create");
     }
 
@@ -1259,11 +1252,10 @@ fn runNestedCompressedInsert(allocator: std.mem.Allocator, io: std.Io) !void {
         2,
         &cols,
         arena.allocator(),
-        null,
         opts,
     );
 
-    var s = try client.query("SELECT id, vals, attrs FROM smoke_nested_compressed ORDER BY id", arena.allocator(), null, opts);
+    var s = try client.query("SELECT id, vals, attrs FROM smoke_nested_compressed ORDER BY id", arena.allocator(), opts);
     var rows: u64 = 0;
     while (try s.next()) |p| switch (p) {
         .data => |b| {
@@ -1292,14 +1284,14 @@ fn runInsertRoundtrip(allocator: std.mem.Allocator, io: std.Io) !void {
     // Create a temp Memory-engine table, INSERT 3 rows, SELECT them back,
     // verify exact value match. Memory engine drops the table when the
     // server restarts so no cleanup needed across runs.
-    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null);
     defer client.close();
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
 
     // Drop+create.
     {
-        var s = try client.query("DROP TABLE IF EXISTS smoke_roundtrip", arena.allocator(), null, .{});
+        var s = try client.query("DROP TABLE IF EXISTS smoke_roundtrip", arena.allocator(), .{});
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
             .exception => |e| {
@@ -1310,7 +1302,7 @@ fn runInsertRoundtrip(allocator: std.mem.Allocator, io: std.Io) !void {
         };
     }
     {
-        var s = try client.query("CREATE TABLE smoke_roundtrip (id UInt32, label String) ENGINE = Memory", arena.allocator(), null, .{});
+        var s = try client.query("CREATE TABLE smoke_roundtrip (id UInt32, label String) ENGINE = Memory", arena.allocator(), .{});
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
             .exception => |e| {
@@ -1334,13 +1326,12 @@ fn runInsertRoundtrip(allocator: std.mem.Allocator, io: std.Io) !void {
         3,
         &cols,
         arena.allocator(),
-        null,
         .{ .query_id = "smoke-insert" },
     );
     std.debug.print("[insert] inserted 3 rows\n", .{});
 
     // SELECT them back ordered.
-    var s = try client.query("SELECT id, label FROM smoke_roundtrip ORDER BY id", arena.allocator(), null, .{});
+    var s = try client.query("SELECT id, label FROM smoke_roundtrip ORDER BY id", arena.allocator(), .{});
     var rows_seen: u32 = 0;
     while (try s.next()) |p| switch (p) {
         .data => |b| {
@@ -1374,7 +1365,7 @@ fn runQueryMixed(allocator: std.mem.Allocator, io: std.Io) !void {
     // + DateTime decode in one go. `numbers(N)` gives us a deterministic
     // 4-row generator; the SELECT then casts/labels columns to known
     // types so the wire response has predictable schema.
-    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null);
     defer client.close();
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -1387,7 +1378,7 @@ fn runQueryMixed(allocator: std.mem.Allocator, io: std.Io) !void {
         \\    toDateTime('2026-05-04 09:00:00') + number AS ts
         \\FROM numbers(4)
     ;
-    var stream = try client.query(sql, arena.allocator(), null, .{ .query_id = "smoke-query-mixed" });
+    var stream = try client.query(sql, arena.allocator(), .{ .query_id = "smoke-query-mixed" });
     var rows_seen: u64 = 0;
     while (try stream.next()) |packet| switch (packet) {
         .data => |b| {
@@ -1420,13 +1411,13 @@ fn runQueryBytes(allocator: std.mem.Allocator, io: std.Io) !void {
     // Full round-trip: send "SELECT 1", drain every server packet through
     // EndOfStream, dump what came back. Verifies wire format end-to-end
     // including BlockInfo, column header, and primitive column decode.
-    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null);
     defer client.close();
 
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
 
-    var stream = try client.query("SELECT 1", arena.allocator(), null, .{ .query_id = "smoke-query-bytes" });
+    var stream = try client.query("SELECT 1", arena.allocator(), .{ .query_id = "smoke-query-bytes" });
     var data_blocks: u32 = 0;
     var progress_packets: u32 = 0;
     while (try stream.next()) |packet| switch (packet) {
@@ -1465,7 +1456,7 @@ fn baseConfig(allocator: std.mem.Allocator) clickzig.Config {
 }
 
 fn runHappy(allocator: std.mem.Allocator, io: std.Io) !void {
-    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null);
     defer client.close();
     const info = client.server_info;
     std.debug.print("[happy] connected: {s} {d}.{d}.{d} rev {d}\n", .{
@@ -1477,16 +1468,16 @@ fn runHappy(allocator: std.mem.Allocator, io: std.Io) !void {
     });
     if (info.timezone) |tz| std.debug.print("[happy] timezone: {s}\n", .{tz});
     if (info.display_name) |dn| std.debug.print("[happy] display:  {s}\n", .{dn});
-    try client.ping(null);
+    try client.ping();
     std.debug.print("[happy] ping/pong ok, last_used_at_ms={d}\n", .{client.last_used_at_ms});
 }
 
 fn runPing(allocator: std.mem.Allocator, io: std.Io) !void {
-    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null, null);
+    const client = try clickzig.Client.connectTcp(baseConfig(allocator), io, null);
     defer client.close();
     const start = client.last_used_at_ms;
     var i: usize = 0;
-    while (i < 100) : (i += 1) try client.ping(null);
+    while (i < 100) : (i += 1) try client.ping();
     std.debug.print("[ping] 100 pings ok; last_used_at_ms drifted from {d} to {d}\n", .{ start, client.last_used_at_ms });
 }
 
@@ -1495,7 +1486,7 @@ fn runWrongPass(allocator: std.mem.Allocator, io: std.Io) !void {
     cfg.password = "obviously-wrong";
     var diag: clickzig.Diagnostics = .{};
     defer diag.deinit();
-    const result = clickzig.Client.connectTcp(cfg, io, null, &diag);
+    const result = clickzig.Client.connectTcp(cfg, io, &diag);
     if (result) |c| {
         c.close();
         std.debug.print("[wrong-pass] FAIL: connected with bad password\n", .{});
@@ -1522,7 +1513,7 @@ fn runUnreachable(allocator: std.mem.Allocator, io: std.Io) !void {
     var cfg = baseConfig(allocator);
     cfg.port = 9001; // Nothing listens here
     cfg.dial_timeout_ms = 3_000;
-    const result = clickzig.Client.connectTcp(cfg, io, null, null);
+    const result = clickzig.Client.connectTcp(cfg, io, null);
     if (result) |c| {
         c.close();
         std.debug.print("[unreachable] FAIL: connected to dead port\n", .{});
@@ -1536,7 +1527,7 @@ fn runWrongHost(allocator: std.mem.Allocator, io: std.Io) !void {
     var cfg = baseConfig(allocator);
     cfg.host = "192.0.2.1"; // TEST-NET-1; documented as unroutable
     cfg.dial_timeout_ms = 3_000;
-    const result = clickzig.Client.connectTcp(cfg, io, null, null);
+    const result = clickzig.Client.connectTcp(cfg, io, null);
     if (result) |c| {
         c.close();
         std.debug.print("[wrong-host] FAIL: somehow connected to TEST-NET-1\n", .{});

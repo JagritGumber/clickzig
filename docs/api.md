@@ -66,7 +66,7 @@ allocated from the allocator passed to `query` or `insert`, not from
 ## Client lifecycle
 
 ```zig
-const client = try clickzig.Client.connectTcp(cfg, io, cancel, diag);
+const client = try clickzig.Client.connectTcp(cfg, io, diag);
 defer client.close();
 ```
 
@@ -82,7 +82,7 @@ One `Client` is not thread-safe. Use one client per thread or `clickzig.Pool`.
 ## Query
 
 ```zig
-var stream = try client.query(sql, query_allocator, cancel, .{});
+var stream = try client.query(sql, query_allocator, .{});
 
 while (try stream.next()) |packet| switch (packet) {
     .data => |block| { /* read columns */ },
@@ -157,7 +157,7 @@ defer settings.deinit(allocator);
 try settings.put(allocator, "max_threads", "4");
 try settings.put(allocator, "readonly", "1");
 
-var stream = try client.query(sql, allocator, null, .{
+var stream = try client.query(sql, allocator, .{
     .settings = &settings,
 });
 ```
@@ -181,7 +181,6 @@ const external = [_]clickzig.ExternalTable{
 var stream = try client.query(
     "SELECT count() FROM ids",
     allocator,
-    null,
     .{ .external_tables = &external },
 );
 ```
@@ -222,9 +221,9 @@ const pool = try clickzig.Pool.init(allocator, io, cfg, .{
 });
 defer pool.deinit();
 
-const client = try pool.acquire(null);
+const client = try pool.acquire();
 defer pool.release(client);
-try client.ping(null);
+try client.ping();
 ```
 
 The pool recycles clients only when `client.isReusable()` is true. Broken or
@@ -247,7 +246,7 @@ const result = try clickzig.fromUri(
     arena.allocator(),
     defaults,
 );
-const client = try clickzig.Client.connectTcp(result.config, io, null, null);
+const client = try clickzig.Client.connectTcp(result.config, io, null);
 ```
 
 Unrecognized query parameters become ClickHouse settings. `client_name` is

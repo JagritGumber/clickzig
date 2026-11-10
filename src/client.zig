@@ -16,7 +16,7 @@
 //!
 //! `Client` is non-copyable (decision #12). Constructors return
 //! `*Client` allocated from `config.control_allocator`. Caller pattern:
-//!   const client = try Client.connectTcp(cfg, io, null, null);
+//!   const client = try Client.connectTcp(cfg, io, null);
 //!   defer client.close();   // single-call; frees the Client struct
 //!
 //! THREAD-SAFETY: a single `Client` is NOT thread-safe. State machine
@@ -26,10 +26,20 @@
 //! the same `Client` are undefined behaviour. For multi-threaded
 //! workloads, use one `Client` per thread or the built-in Pool.
 //!
-//! Cancellation note: `*const std.atomic.Value(bool)` is the right
-//! primitive for our sync API. Zig 0.16's `Future.cancel` is tied to
-//! async task cancellation and would require restructuring every public
-//! method around `io.async`. The atomic-bool stays.
+//! ASYNC + CANCELLATION: every blocking step goes through the `std.Io`
+//! passed at connect time, so the same API runs on `Io.Threaded` (one OS
+//! thread per blocking call) or on an evented `Io` (fibers over io_uring /
+//! kqueue). Run calls concurrently with `io.async` / `Io.Group`, one
+//! Client per in-flight call (or use `Pool`).
+//!
+//! Cancellation is `Io` cancellation: `future.cancel(io)` or
+//! `group.cancel(io)` makes the pending socket operation return
+//! `error.Canceled`, which every Client method propagates unchanged.
+//! If a query is canceled while the client is waiting for the next
+//! server packet, the client sends a protocol `Cancel` packet and drains
+//! the server's reply (shielded from further cancellation, bounded by
+//! `Config.cancel_drain_timeout_ms`), so the connection stays reusable.
+//! A cancel that lands mid-packet leaves the connection broken.
 
 const std = @import("std");
 const protocol = @import("protocol.zig");
@@ -58,6 +68,8 @@ pub const Event = enum {
     ping_sent,
     pong_received,
     query_sent,
+    /// A canceled query sent a protocol `Cancel` packet to the server.
+    query_cancel_sent,
     closing,
     closed,
 };
@@ -67,7 +79,10 @@ pub const QueryError = error{
     ProtocolError,
     ReadTimeout,
     WriteTimeout,
-    Cancelled,
+    /// The calling task was canceled via `std.Io` (`Future.cancel`,
+    /// `Group.cancel`). Check `Client.isReusable()` to see whether the
+    /// in-flight query was cleanly aborted.
+    Canceled,
     OutOfMemory,
     ClientNotReady,
 };
@@ -111,8 +126,8 @@ pub const ConnectError = error{
     ReadTimeout,
     /// Write on an established socket exceeded `write_timeout_ms`.
     WriteTimeout,
-    /// Caller-provided cancellation token observed `true`.
-    Cancelled,
+    /// The calling task was canceled via `std.Io`.
+    Canceled,
     OutOfMemory,
 };
 
@@ -144,6 +159,10 @@ pub const Config = struct {
     dial_timeout_ms: u32 = 30_000,
     read_timeout_ms: u32 = 60_000,
     write_timeout_ms: u32 = 30_000,
+    /// Read budget for draining the server's reply after a canceled
+    /// query sends a protocol `Cancel` packet. If the server does not
+    /// finish within this window the connection is marked broken.
+    cancel_drain_timeout_ms: u32 = 5_000,
 
     /// Per-client default settings forwarded by query/insert paths.
     settings: ?*const std.StringHashMapUnmanaged([]const u8) = null,
@@ -187,11 +206,9 @@ pub const Client = struct {
     pub fn connectTcp(
         config: Config,
         io: std.Io,
-        cancel: ?*const std.atomic.Value(bool),
         diag: ?*Diagnostics,
     ) ConnectError!*Client {
         emit(config, .connecting);
-        if (cancellationRequested(cancel)) return error.Cancelled;
 
         const tcp = transport_mod.TcpTransport.connect(config.control_allocator, io, config.host, config.port, .{
             .read_buffer_size = config.read_buffer_size,
@@ -206,7 +223,7 @@ pub const Client = struct {
         tcp.transport().setReadTimeout(config.read_timeout_ms) catch {};
         tcp.transport().setWriteTimeout(config.write_timeout_ms) catch {};
 
-        const client = try fromTransport(config, io, tcp.transport(), cancel, diag);
+        const client = try fromTransport(config, io, tcp.transport(), diag);
         client.transport_owned = tcp;
         return client;
     }
@@ -217,7 +234,6 @@ pub const Client = struct {
         config: Config,
         io: std.Io,
         transport: transport_mod.Transport,
-        cancel: ?*const std.atomic.Value(bool),
         diag: ?*Diagnostics,
     ) ConnectError!*Client {
         const client = config.control_allocator.create(Client) catch return error.OutOfMemory;
@@ -238,12 +254,6 @@ pub const Client = struct {
             .compression_method = config.compression_method,
         };
 
-        if (cancellationRequested(cancel)) {
-            client.is_broken = true;
-            client.state = .broken;
-            return error.Cancelled;
-        }
-
         // --- Hello write + flush ---
         emit(config, .hello_sent);
         hello.writeClientHello(transport.writer(), config.database, config.username, config.password, config.client_name) catch |e| {
@@ -256,12 +266,6 @@ pub const Client = struct {
             client.state = .broken;
             return mapWriteError(transport, e);
         };
-
-        if (cancellationRequested(cancel)) {
-            client.is_broken = true;
-            client.state = .broken;
-            return error.Cancelled;
-        }
 
         // --- ServerHello / Exception read ---
         const result = hello.readHelloResult(transport.reader(), config.control_allocator) catch |e| {
@@ -290,12 +294,6 @@ pub const Client = struct {
         }
         emit(config, .hello_received);
         errdefer client.server_info.deinit();
-
-        if (cancellationRequested(cancel)) {
-            client.is_broken = true;
-            client.state = .broken;
-            return error.Cancelled;
-        }
 
         // --- Addendum write + flush (no-op for pre-54_458 servers) ---
         // Use the negotiated revision, NOT the server's reported revision —
@@ -350,12 +348,9 @@ pub const Client = struct {
     }
 
     /// Health check. Sends Ping, expects Pong. Updates last_used_at_ms.
-    pub fn ping(
-        self: *Client,
-        cancel: ?*const std.atomic.Value(bool),
-    ) ConnectError!void {
+    pub fn ping(self: *Client) ConnectError!void {
         if (self.state != .ready) return error.ConnectionFailed;
-        if (cancellationRequested(cancel)) return error.Cancelled;
+        self.io.checkCancel() catch return error.Canceled;
         self.state = .busy;
 
         wire.writeClientPacketId(self.transport.writer(), .Ping) catch |e| {
@@ -369,12 +364,6 @@ pub const Client = struct {
             return mapWriteError(self.transport, e);
         };
         emit(self.config, .ping_sent);
-
-        if (cancellationRequested(cancel)) {
-            self.is_broken = true;
-            self.state = .broken;
-            return error.Cancelled;
-        }
 
         const pkt = wire.readServerPacketId(self.transport.reader()) catch |e| {
             self.is_broken = true;
@@ -406,11 +395,12 @@ pub const Client = struct {
     pub fn sendQuery(
         self: *Client,
         query_text: []const u8,
-        cancel: ?*const std.atomic.Value(bool),
         opts_in: query_mod.QueryOptions,
     ) QueryError!void {
         if (self.state != .ready) return error.ClientNotReady;
-        if (cancellationRequested(cancel)) return error.Cancelled;
+        // Observe a pending cancel before any byte hits the wire, so a
+        // task canceled before it started leaves the connection usable.
+        self.io.checkCancel() catch return error.Canceled;
         self.state = .busy;
 
         // If caller didn't override, fall back to the client-wide setting.
@@ -510,11 +500,10 @@ pub const Client = struct {
         self: *Client,
         query_text: []const u8,
         query_allocator: std.mem.Allocator,
-        cancel: ?*const std.atomic.Value(bool),
         opts: query_mod.QueryOptions,
     ) QueryError!result_stream_mod.ResultStream {
         const effective_compression: protocol.CompressionEnabled = if (opts.compression == .Enable or self.compression == .Enable) .Enable else .Disable;
-        try self.sendQuery(query_text, cancel, opts);
+        try self.sendQuery(query_text, opts);
         return .{
             .reader = self.transport.reader(),
             .allocator = query_allocator,
@@ -526,6 +515,7 @@ pub const Client = struct {
                 .is_broken = &self.is_broken,
                 .set_ready = setReadyImpl,
                 .set_broken = setBrokenImpl,
+                .abort = abortImpl,
             },
         };
     }
@@ -545,10 +535,9 @@ pub const Client = struct {
         num_rows: u64,
         columns: []const block_mod.InsertColumn,
         query_allocator: std.mem.Allocator,
-        cancel: ?*const std.atomic.Value(bool),
         opts: query_mod.QueryOptions,
     ) QueryError!void {
-        try self.sendQuery(query_text, cancel, opts);
+        try self.sendQuery(query_text, opts);
         const negotiated = self.server_info.negotiated(protocol.CLIENT_REVISION);
         const effective_compression: protocol.CompressionEnabled = if (opts.compression == .Enable or self.compression == .Enable) .Enable else .Disable;
         const effective_compression_method: compression_mod.WriteMethod = if (opts.compression_method != .lz4) opts.compression_method else self.compression_method;
@@ -562,9 +551,16 @@ pub const Client = struct {
         var schema_seen = false;
         while (!schema_seen) {
             const pkt = wire.readServerPacketId(self.transport.reader()) catch |e| {
+                const mapped = mapReadErrQuery(self.transport, e);
+                // Canceled while waiting at a packet boundary: abort the
+                // INSERT server-side and keep the connection if we can.
+                if (mapped == error.Canceled and self.abortQuery(query_allocator, effective_compression)) {
+                    self.state = .ready;
+                    return error.Canceled;
+                }
                 self.is_broken = true;
                 self.state = .broken;
-                return mapReadErrQuery(self.transport, e);
+                return mapped;
             };
             switch (pkt) {
                 .Data => {
@@ -715,6 +711,7 @@ pub const Client = struct {
                 .is_broken = &self.is_broken,
                 .set_ready = setReadyImpl,
                 .set_broken = setBrokenImpl,
+                .abort = abortImpl,
             },
         };
         while (try mapStreamErr(stream.next())) |packet| switch (packet) {
@@ -728,15 +725,67 @@ pub const Client = struct {
             .progress, .profile_info => {},
         };
     }
+
+    /// Abort the in-flight query: send a protocol `Cancel` packet and
+    /// drain the server's reply up to `EndOfStream` / `Exception`.
+    /// Runs with cancellation blocked so a pending cancel request cannot
+    /// interrupt the cleanup itself; reads are bounded by
+    /// `Config.cancel_drain_timeout_ms` (owned TCP transports only).
+    /// Returns true when the connection is back in a clean state. The
+    /// caller decides the resulting `state`.
+    fn abortQuery(
+        self: *Client,
+        allocator: std.mem.Allocator,
+        compression: protocol.CompressionEnabled,
+    ) bool {
+        const io = self.io;
+        const prev_protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(prev_protection);
+
+        wire.writeClientPacketId(self.transport.writer(), .Cancel) catch return false;
+        self.transport.writer().flush() catch return false;
+        emit(self.config, .query_cancel_sent);
+
+        const owns_timeouts = self.transport_owned != null;
+        if (owns_timeouts) self.transport.setReadTimeout(self.config.cancel_drain_timeout_ms) catch {};
+        defer if (owns_timeouts) self.transport.setReadTimeout(self.config.read_timeout_ms) catch {};
+
+        var drain: result_stream_mod.ResultStream = .{
+            .reader = self.transport.reader(),
+            .allocator = allocator,
+            .server_revision = self.server_info.negotiated(protocol.CLIENT_REVISION),
+            .compression = compression,
+            .transport = self.transport,
+        };
+        while (true) {
+            const packet = (drain.next() catch return false) orelse return false;
+            switch (packet) {
+                .end_of_stream => return true,
+                .exception => |e| {
+                    // Usually QUERY_WAS_CANCELLED; either way the
+                    // server has terminated the query.
+                    e.deinit();
+                    return true;
+                },
+                else => packet.deinit(allocator),
+            }
+        }
+    }
 };
+
+fn abortImpl(state: *anyopaque, allocator: std.mem.Allocator, compression: protocol.CompressionEnabled) bool {
+    const c: *Client = @ptrCast(@alignCast(state));
+    return c.abortQuery(allocator, compression);
+}
 
 fn mapReadErrQuery(transport: ?transport_mod.Transport, e: anyerror) QueryError {
     if (readTimedOut(transport, e)) return error.ReadTimeout;
+    if (readCanceled(transport, e)) return error.Canceled;
     return switch (e) {
         error.ReadFailed, error.EndOfStream => error.ConnectionFailed,
         error.Timeout => error.ReadTimeout,
         error.OutOfMemory => error.OutOfMemory,
-        error.Canceled, error.Cancelled => error.Cancelled,
+        error.Canceled => error.Canceled,
         else => error.ProtocolError,
     };
 }
@@ -745,6 +794,7 @@ fn mapStreamErr(r: anytype) QueryError!@typeInfo(@TypeOf(r)).error_union.payload
     return r catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         error.ReadTimeout => error.ReadTimeout,
+        error.Canceled => error.Canceled,
         else => error.ProtocolError,
     };
 }
@@ -769,29 +819,26 @@ inline fn emit(cfg: Config, event: Event) void {
     }
 }
 
-inline fn cancellationRequested(cancel: ?*const std.atomic.Value(bool)) bool {
-    if (cancel) |c| return c.load(.acquire);
-    return false;
-}
-
 fn mapWriteError(transport: ?transport_mod.Transport, e: anyerror) ConnectError {
     if (writeTimedOut(transport, e)) return error.WriteTimeout;
+    if (writeCanceled(transport, e)) return error.Canceled;
     return switch (e) {
         error.WriteFailed => error.ConnectionFailed,
         error.Timeout => error.WriteTimeout,
         error.OutOfMemory => error.OutOfMemory,
-        error.Canceled, error.Cancelled => error.Cancelled,
+        error.Canceled => error.Canceled,
         else => error.ConnectionFailed,
     };
 }
 
 fn mapReadError(transport: ?transport_mod.Transport, e: anyerror) ConnectError {
     if (readTimedOut(transport, e)) return error.ReadTimeout;
+    if (readCanceled(transport, e)) return error.Canceled;
     return switch (e) {
         error.ReadFailed, error.EndOfStream => error.ConnectionFailed,
         error.Timeout => error.ReadTimeout,
         error.OutOfMemory => error.OutOfMemory,
-        error.Canceled, error.Cancelled => error.Cancelled,
+        error.Canceled => error.Canceled,
         error.OverlongVarint,
         error.VarintOverflow,
         error.UnknownServerPacket,
@@ -805,11 +852,12 @@ fn mapReadError(transport: ?transport_mod.Transport, e: anyerror) ConnectError {
 
 fn mapWriteErrQuery(transport: ?transport_mod.Transport, e: anyerror) QueryError {
     if (writeTimedOut(transport, e)) return error.WriteTimeout;
+    if (writeCanceled(transport, e)) return error.Canceled;
     return switch (e) {
         error.WriteFailed => error.ConnectionFailed,
         error.Timeout => error.WriteTimeout,
         error.OutOfMemory => error.OutOfMemory,
-        error.Canceled, error.Cancelled => error.Cancelled,
+        error.Canceled => error.Canceled,
         else => error.ConnectionFailed,
     };
 }
@@ -830,6 +878,24 @@ fn writeTimedOut(transport: ?transport_mod.Transport, e: anyerror) bool {
     return err == error.Timeout;
 }
 
+/// The transport reports `error.ReadFailed` / `error.WriteFailed` through
+/// the `std.Io.Reader`/`Writer` interface and keeps the real cause on the
+/// side. Recover `error.Canceled` from there so cancellation is reported
+/// as such instead of as a connection failure.
+fn readCanceled(transport: ?transport_mod.Transport, e: anyerror) bool {
+    if (e == error.Canceled) return true;
+    if (e != error.ReadFailed) return false;
+    const t = transport orelse return false;
+    return (t.lastReadError() orelse return false) == error.Canceled;
+}
+
+fn writeCanceled(transport: ?transport_mod.Transport, e: anyerror) bool {
+    if (e == error.Canceled) return true;
+    if (e != error.WriteFailed) return false;
+    const t = transport orelse return false;
+    return (t.lastWriteError() orelse return false) == error.Canceled;
+}
+
 fn mapTcpConnectError(e: transport_mod.ConnectError) ConnectError {
     return switch (e) {
         error.ConnectionTimeout => error.ConnectTimeout,
@@ -838,7 +904,7 @@ fn mapTcpConnectError(e: transport_mod.ConnectError) ConnectError {
         error.HostResolutionFailed, error.InvalidHost => error.DnsFailure,
         error.OutOfMemory => error.OutOfMemory,
         error.ConcurrencyUnavailable => error.ConnectionFailed,
-        error.Canceled => error.Cancelled,
+        error.Canceled => error.Canceled,
     };
 }
 

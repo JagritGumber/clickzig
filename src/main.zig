@@ -1,8 +1,11 @@
 //! clickzig - native-protocol ClickHouse client for Zig 0.17+
 //!
-//! Status: v0.16.0. Sync TCP client targeting the ClickHouse
-//! native protocol (port 9000), with query streaming, Native INSERT,
+//! Status: v0.17.0. `std.Io`-native client for the ClickHouse native
+//! protocol (port 9000), with query streaming, Native INSERT,
 //! compression, pooling, TLS transport support, and DSN parsing.
+//! Every blocking step goes through the caller's `std.Io`, so the same
+//! API is synchronous on `Io.Threaded` and asynchronous on an evented
+//! `Io`; cancellation is `Io` cancellation (`Future.cancel`).
 //!
 //! Usage sketch:
 //!   var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -15,10 +18,10 @@
 //!       .write_buffer_size = 4 * 1024,
 //!       .username = "default",
 //!       .password = "test",
-//!   }, io, null, null);
+//!   }, io, null);
 //!   defer client.close();
 //!
-//!   try client.ping(null);
+//!   try client.ping();
 
 const std = @import("std");
 
@@ -62,6 +65,7 @@ pub const Config = client_mod.Config;
 pub const Event = client_mod.Event;
 pub const Diagnostics = client_mod.Diagnostics;
 pub const ConnectError = client_mod.ConnectError;
+pub const QueryError = client_mod.QueryError;
 pub const State = client_mod.State;
 pub const ServerInfo = client_mod.ServerInfo;
 

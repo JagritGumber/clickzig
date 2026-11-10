@@ -8,9 +8,9 @@
 //! Lifecycle:
 //!   var pool = try Pool.init(allocator, io, config, .{ .max_size = 8 });
 //!   defer pool.deinit();
-//!   const client = try pool.acquire(null);
+//!   const client = try pool.acquire();
 //!   defer pool.release(client);
-//!   try client.ping(null);
+//!   try client.ping();
 //!
 //! Behaviour:
 //!   - Lazy creation: dial only when an acquire can't be satisfied
@@ -21,11 +21,14 @@
 //!   - Stale checking: optional `max_lifetime_ms` retires Clients that
 //!     have lived longer than the budget on next release.
 //!
-//! Threading model:
-//!   - The pool uses a `std.Thread.Mutex` to guard the idle/in-use
-//!     bookkeeping. Acquire and release are O(1) amortised.
-//!   - Concurrent acquires beyond max_size block on a `Condition` until
-//!     someone releases.
+//! Concurrency model:
+//!   - The pool uses `std.Io.Mutex` / `std.Io.Condition`, so it is safe
+//!     to share between OS threads (`Io.Threaded`) and between fibers
+//!     on an evented `Io`. Acquire and release are O(1) amortised.
+//!   - Concurrent acquires beyond max_size wait on the `Condition` until
+//!     someone releases. That wait (and dialing a new Client) is a
+//!     cancellation point: canceling the waiting task makes `acquire`
+//!     return `error.Canceled` without leaking a slot.
 //!
 //! This file exceeds 100 lines because the lifecycle + bookkeeping +
 //! state machine + tests live together. Splitting them would obscure
@@ -42,7 +45,6 @@ pub const Options = struct {
 
 pub const Error = error{
     PoolClosed,
-    AcquireCancelled,
 } || client_mod.ConnectError;
 
 pub const Pool = struct {
@@ -87,20 +89,16 @@ pub const Pool = struct {
         self.allocator.destroy(self);
     }
 
-    /// Acquire a Client from the pool. Blocks if all max_size Clients
-    /// are currently in use (until one is released). Returns the
-    /// caller's cancellation error if the cancel token flips while
-    /// waiting.
-    pub fn acquire(
-        self: *Pool,
-        cancel: ?*const std.atomic.Value(bool),
-    ) Error!*client_mod.Client {
-        self.mutex.lockUncancelable(self.io);
+    /// Acquire a Client from the pool. Waits if all max_size Clients
+    /// are currently in use (until one is released). Returns
+    /// `error.Canceled` if the calling task is canceled while waiting
+    /// or dialing.
+    pub fn acquire(self: *Pool) Error!*client_mod.Client {
+        try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
         while (true) {
             if (self.closed) return error.PoolClosed;
-            if (cancellationRequested(cancel)) return error.AcquireCancelled;
 
             // Grab an idle Client first, validating it's still good.
             while (self.idle.pop()) |c| {
@@ -116,7 +114,7 @@ pub const Pool = struct {
             if (self.live_count < self.opts.max_size) {
                 self.live_count += 1;
                 self.mutex.unlock(self.io);
-                const c = client_mod.Client.connectTcp(self.config, self.io, cancel, null) catch |e| {
+                const c = client_mod.Client.connectTcp(self.config, self.io, null) catch |e| {
                     self.mutex.lockUncancelable(self.io);
                     self.live_count -= 1;
                     self.cond.signal(self.io);
@@ -126,8 +124,9 @@ pub const Pool = struct {
                 return c;
             }
 
-            // At cap; wait for a release.
-            self.cond.waitUncancelable(self.io, &self.mutex);
+            // At cap; wait for a release. `wait` re-acquires the mutex
+            // before returning, including on error.Canceled.
+            try self.cond.wait(self.io, &self.mutex);
         }
     }
 
@@ -179,11 +178,6 @@ pub const Pool = struct {
         return false;
     }
 };
-
-fn cancellationRequested(cancel: ?*const std.atomic.Value(bool)) bool {
-    if (cancel) |c| return c.load(.acquire);
-    return false;
-}
 
 const testing = std.testing;
 

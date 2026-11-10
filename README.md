@@ -75,13 +75,13 @@ pub fn main(init: std.process.Init) !void {
         .write_buffer_size = 4 * 1024,
         .username = "default",
         .password = "test",
-    }, init.io, null, null);
+    }, init.io, null);
     defer client.close();
 
     var arena: std.heap.ArenaAllocator = .init(init.gpa);
     defer arena.deinit();
 
-    var stream = try client.query("SELECT number, number * 2 FROM numbers(5)", arena.allocator(), null, .{});
+    var stream = try client.query("SELECT number, number * 2 FROM numbers(5)", arena.allocator(), .{});
     while (try stream.next()) |packet| switch (packet) {
         .data => |b| {
             for (0..b.num_rows) |i| std.debug.print("{d} -> {d}\n", .{ b.columns[0].column.UInt64[i], b.columns[1].column.UInt64[i] });
@@ -107,7 +107,6 @@ try client.insert(
     3,
     &cols,
     arena.allocator(),
-    null,
     .{},
 );
 ```
@@ -125,7 +124,6 @@ try params.putDate(arena.allocator(), "day", "2026-05-07");
 var stream = try client.query(
     "SELECT {n:UInt64} + 1, {label:String}, toDate({day:String})",
     arena.allocator(),
-    null,
     .{ .parameters = &params },
 );
 ```
@@ -138,9 +136,9 @@ var stream = try client.query(
 const pool = try clickzig.Pool.init(init.gpa, init.io, config, .{ .max_size = 16 });
 defer pool.deinit();
 
-const client = try pool.acquire(null);
+const client = try pool.acquire();
 defer pool.release(client);
-try client.ping(null);
+try client.ping();
 ```
 
 ## quick start: dsn
@@ -153,7 +151,7 @@ const result = try clickzig.fromUri(
     arena.allocator(),
     .{ .control_allocator = init.gpa, .read_buffer_size = 64 * 1024, .write_buffer_size = 4 * 1024 },
 );
-const client = try clickzig.Client.connectTcp(result.config, init.io, null, null);
+const client = try clickzig.Client.connectTcp(result.config, init.io, null);
 defer client.close();
 ```
 

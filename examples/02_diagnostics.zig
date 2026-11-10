@@ -29,7 +29,7 @@ pub fn main(init: std.process.Init) !void {
         .write_buffer_size = 4 * 1024,
         .username = "default",
         .password = "definitely-not-the-password",
-    }, io, null, &diag);
+    }, io, &diag);
 
     if (result) |client| {
         client.close();

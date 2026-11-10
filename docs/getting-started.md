@@ -43,7 +43,7 @@ pub fn main(init: std.process.Init) !void {
         .port = 9000,
         .username = "default",
         .password = "test",
-    }, init.io, null, null);
+    }, init.io, null);
     defer client.close();
 
     var arena: std.heap.ArenaAllocator = .init(init.gpa);
@@ -52,7 +52,6 @@ pub fn main(init: std.process.Init) !void {
     var stream = try client.query(
         "SELECT number, number * 2 FROM numbers(5)",
         arena.allocator(),
-        null,
         .{},
     );
 
@@ -95,7 +94,6 @@ try client.insert(
     ids.len,
     &columns,
     arena.allocator(),
-    null,
     .{},
 );
 ```
@@ -115,7 +113,6 @@ try params.putString(arena.allocator(), "label", "clickzig");
 var stream = try client.query(
     "SELECT {n:UInt64} + 1, {label:String}",
     arena.allocator(),
-    null,
     .{ .parameters = &params },
 );
 ```
@@ -141,7 +138,7 @@ var cfg: clickzig.Config = .{
 You can also enable compression per query or insert:
 
 ```zig
-try client.insert(sql, "", rows, &columns, arena.allocator(), null, .{
+try client.insert(sql, "", rows, &columns, arena.allocator(), .{
     .compression = .Enable,
     .compression_method = .lz4,
 });
