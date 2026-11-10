@@ -144,7 +144,7 @@ pub fn writeFrameLz4(
 
     const compressed_size: u32 = @intCast(HEADER_TAIL_BYTES + enc_len);
     const decompressed_size: u32 = @intCast(data.len);
-    hash_buf[0] = @intFromEnum(Method.lz4);
+    hash_buf[0] = @backingInt(Method.lz4);
     std.mem.writeInt(u32, hash_buf[1..5], compressed_size, .little);
     std.mem.writeInt(u32, hash_buf[5..9], decompressed_size, .little);
     const used = hash_buf[0 .. HEADER_TAIL_BYTES + enc_len];
@@ -173,7 +173,7 @@ pub fn writeFrameZstd(
     const decompressed_size: u32 = @intCast(data.len);
     var hash_buf = try allocator.alloc(u8, HEADER_TAIL_BYTES + raw_payload.len);
     defer allocator.free(hash_buf);
-    hash_buf[0] = @intFromEnum(Method.zstd);
+    hash_buf[0] = @backingInt(Method.zstd);
     std.mem.writeInt(u32, hash_buf[1..5], compressed_size, .little);
     std.mem.writeInt(u32, hash_buf[5..9], decompressed_size, .little);
     @memcpy(hash_buf[HEADER_TAIL_BYTES..], raw_payload);
@@ -239,7 +239,7 @@ fn writeRawFrameForTest(
 ) !void {
     var hash_buf: std.Io.Writer.Allocating = .init(testing.allocator);
     defer hash_buf.deinit();
-    try hash_buf.writer.writeByte(@intFromEnum(method));
+    try hash_buf.writer.writeByte(@backingInt(method));
     try hash_buf.writer.writeInt(u32, @intCast(HEADER_TAIL_BYTES + compressed_payload.len), .little);
     try hash_buf.writer.writeInt(u32, decompressed_size, .little);
     try hash_buf.writer.writeAll(compressed_payload);
@@ -340,7 +340,7 @@ test "readFrame rejects none frame with mismatched payload and decompressed size
 
 test "readFrame rejects decompressed size over cap before allocation" {
     var tail: [9]u8 = undefined;
-    tail[0] = @intFromEnum(Method.lz4);
+    tail[0] = @backingInt(Method.lz4);
     std.mem.writeInt(u32, tail[1..5], 9, .little);
     std.mem.writeInt(u32, tail[5..9], @intCast(MAX_DECOMPRESSED_FRAME_BYTES + 1), .little);
     const sum = cityhash.cityhash128(&tail);

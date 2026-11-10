@@ -196,7 +196,7 @@ test "audit A9 hostile Sparse count is rejected before sparse index allocation" 
 
 test "audit B1 hostile LZ4 decompressed_size is rejected before frame allocation" {
     var tail: [9]u8 = undefined;
-    tail[0] = @intFromEnum(compression.Method.lz4);
+    tail[0] = @backingInt(compression.Method.lz4);
     std.mem.writeInt(u32, tail[1..5], 9, .little);
     std.mem.writeInt(u32, tail[5..9], std.math.maxInt(u32), .little);
     const sum = cityhash.cityhash128(&tail);

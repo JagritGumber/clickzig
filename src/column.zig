@@ -22,9 +22,20 @@ pub const MAX_COLUMN_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Identifies a primitive (non-wrapped) column type.
 pub const TypeId = enum {
-    UInt8, UInt16, UInt32, UInt64, UInt128, UInt256,
-    Int8, Int16, Int32, Int64, Int128, Int256,
-    Float32, Float64,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    UInt128,
+    UInt256,
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    Int128,
+    Int256,
+    Float32,
+    Float64,
     String,
 };
 
@@ -260,7 +271,7 @@ pub fn typeIdFromName(type_name: []const u8) ?TypeId {
         //   P <= 18 → Int64   (Decimal64)
         //   P <= 38 → Int128  (Decimal128)
         //   P <= 76 → Int256  (Decimal256)
-        const inside = type_name[8..type_name.len - 1];
+        const inside = type_name[8 .. type_name.len - 1];
         const comma = std.mem.indexOfScalar(u8, inside, ',') orelse return null;
         const p_str = std.mem.trim(u8, inside[0..comma], " ");
         const p = std.fmt.parseInt(u8, p_str, 10) catch return null;
@@ -394,10 +405,7 @@ pub fn readColumn(
 }
 
 pub fn hasCustomSerialization(type_name: []const u8) bool {
-    return std.mem.eql(u8, type_name, "JSON")
-        or std.mem.startsWith(u8, type_name, "JSON(")
-        or std.mem.eql(u8, type_name, "Dynamic")
-        or extractSparseInner(type_name) != null;
+    return std.mem.eql(u8, type_name, "JSON") or std.mem.startsWith(u8, type_name, "JSON(") or std.mem.eql(u8, type_name, "Dynamic") or extractSparseInner(type_name) != null;
 }
 
 pub fn readCustomColumn(
@@ -669,7 +677,9 @@ pub fn extractMapKV(type_name: []const u8) ?MapKV {
     while (i < inside.len) : (i += 1) {
         switch (inside[i]) {
             '(' => depth += 1,
-            ')' => if (depth > 0) { depth -= 1; },
+            ')' => if (depth > 0) {
+                depth -= 1;
+            },
             ',' => if (depth == 0) {
                 const k = std.mem.trim(u8, inside[0..i], " ");
                 const v = std.mem.trim(u8, inside[i + 1 ..], " ");
@@ -1342,7 +1352,7 @@ test "Array(UInt32) round-trips" {
 test "FixedString(4) round-trips" {
     var buf: [32]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    var data = [_]u8{ 'a','b','c','d', 'e','f','g','h', 'i','j','k','l' };
+    var data = [_]u8{ 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l' };
     const col_in: Column = .{ .FixedString = .{ .width = 4, .data = &data } };
     try writeColumn(&w, col_in);
 
@@ -1357,7 +1367,7 @@ test "FixedString(4) round-trips" {
 test "UUID round-trips" {
     var buf: [64]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    var rows: [2][16]u8 = .{ .{1}**16, .{2,2,2,2, 2,2,2,2, 2,2,2,2, 2,2,2,2} };
+    var rows: [2][16]u8 = .{ @splat(1), @splat(2) };
     const col_in: Column = .{ .UUID = &rows };
     try writeColumn(&w, col_in);
 
@@ -1881,7 +1891,7 @@ test "writeLowCardinality(FixedString(4)) round-trips" {
     const ally = testing.allocator;
     var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    var data = [_]u8{ 'a','a','a','a',  'b','b','b','b',  'a','a','a','a' };
+    var data = [_]u8{ 'a', 'a', 'a', 'a', 'b', 'b', 'b', 'b', 'a', 'a', 'a', 'a' };
     const col_in: Column = .{ .FixedString = .{ .width = 4, .data = &data } };
     try writeLowCardinality(&w, ally, "FixedString(4)", col_in, 3);
 

@@ -1,4 +1,4 @@
-//! clickzig - native-protocol ClickHouse client for Zig 0.16+
+//! clickzig - native-protocol ClickHouse client for Zig 0.17+
 //!
 //! Status: v0.16.0. Sync TCP client targeting the ClickHouse
 //! native protocol (port 9000), with query streaming, Native INSERT,
@@ -74,7 +74,7 @@ pub const TcpOptions = transport_mod.TcpOptions;
 /// per-query overrides attach on QueryOptions.
 pub const SettingsMap = std.StringHashMapUnmanaged([]const u8);
 
-pub const VERSION = "0.16.0";
+pub const VERSION = "0.17.0";
 
 test {
     std.testing.refAllDecls(@This());

@@ -83,8 +83,8 @@ pub fn writeClientQuery(
         try wire.writeStringBinary(writer, "");
     }
 
-    try varint.writeVarUInt(writer, @intFromEnum(opts.stage));
-    try varint.writeVarUInt(writer, @intFromEnum(opts.compression));
+    try varint.writeVarUInt(writer, @backingInt(opts.stage));
+    try varint.writeVarUInt(writer, @backingInt(opts.compression));
     try wire.writeStringBinary(writer, query);
 
     // Query parameters — gated. Empty map encodes to a single sentinel byte.
@@ -139,7 +139,7 @@ test "writeClientQuery emits Query packet ID first" {
     var buf: [512]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try writeClientQuery(&w, "SELECT 1", .{}, protocol.CLIENT_REVISION, .{});
-    try testing.expectEqual(@as(u8, @intFromEnum(protocol.ClientPacket.Query)), w.buffered()[0]);
+    try testing.expectEqual(@as(u8, @backingInt(protocol.ClientPacket.Query)), w.buffered()[0]);
 }
 
 test "writeClientQuery keeps settings and parameters separate" {
@@ -187,7 +187,7 @@ test "writeEmptyDataTerminator at pinned revision emits the BlockInfo prelude" {
     try writeEmptyDataTerminator(&w, protocol.CLIENT_REVISION);
     const out = w.buffered();
     // Data packet id (2), then empty table name (1 byte = 0)
-    try testing.expectEqual(@as(u8, @intFromEnum(protocol.ClientPacket.Data)), out[0]);
+    try testing.expectEqual(@as(u8, @backingInt(protocol.ClientPacket.Data)), out[0]);
     try testing.expectEqual(@as(u8, 0), out[1]);
     // BlockInfo: 1, 0, 2, then i32 LE -1, then 0 (end)
     try testing.expectEqual(@as(u8, 1), out[2]);

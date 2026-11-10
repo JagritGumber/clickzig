@@ -284,10 +284,7 @@ pub const Client = struct {
                 // ergonomic catch-blocks. Modern CH (22.x+) collapsed
                 // WRONG_PASSWORD/REQUIRED_PASSWORD into AUTHENTICATION_FAILED;
                 // accept all three for cross-version compatibility.
-                const is_auth = exc.code == cherror.Code.AUTHENTICATION_FAILED
-                    or exc.code == cherror.Code.REQUIRED_PASSWORD
-                    or exc.code == cherror.Code.WRONG_PASSWORD
-                    or exc.code == cherror.Code.UNKNOWN_USER;
+                const is_auth = exc.code == cherror.Code.AUTHENTICATION_FAILED or exc.code == cherror.Code.REQUIRED_PASSWORD or exc.code == cherror.Code.WRONG_PASSWORD or exc.code == cherror.Code.UNKNOWN_USER;
                 return if (is_auth) error.AuthenticationFailed else error.ServerExceptionDuringHello;
             },
         }
@@ -890,12 +887,11 @@ test "timeout errors map to public connect/read/write variants" {
 test "Event enum covers handshake + ping + close lifecycle" {
     // Compile-time check that the values listed in the plan are present.
     const _e = [_]Event{
-        .connecting,        .connected,
-        .hello_sent,        .hello_received,
-        .addendum_sent,     .server_exception_received,
-        .ping_sent,         .pong_received,
-        .closing,           .closed,
+        .connecting,    .connected,
+        .hello_sent,    .hello_received,
+        .addendum_sent, .server_exception_received,
+        .ping_sent,     .pong_received,
+        .closing,       .closed,
     };
     _ = _e;
 }
-

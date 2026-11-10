@@ -86,7 +86,7 @@ pub fn writeClientPacketId(
     writer: *std.Io.Writer,
     p: protocol.ClientPacket,
 ) std.Io.Writer.Error!void {
-    try varint.writeVarUInt(writer, @intFromEnum(p));
+    try varint.writeVarUInt(writer, @backingInt(p));
 }
 
 /// Read a server-side packet ID as a varint and convert to enum.

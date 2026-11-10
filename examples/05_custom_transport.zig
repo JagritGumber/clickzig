@@ -45,8 +45,12 @@ const MemTransport = struct {
     fn cImpl(_: *anyopaque) void {}
     fn srtImpl(_: *anyopaque, _: ?u32) anyerror!void {}
     fn swtImpl(_: *anyopaque, _: ?u32) anyerror!void {}
-    fn lreImpl(_: *anyopaque) ?anyerror { return null; }
-    fn lweImpl(_: *anyopaque) ?anyerror { return null; }
+    fn lreImpl(_: *anyopaque) ?anyerror {
+        return null;
+    }
+    fn lweImpl(_: *anyopaque) ?anyerror {
+        return null;
+    }
 
     const vtable: clickzig.Transport.VTable = .{
         .reader = rImpl,

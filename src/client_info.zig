@@ -67,7 +67,7 @@ pub fn writeClientInfo(
     info: ClientInfo,
     server_revision: u64,
 ) std.Io.Writer.Error!void {
-    try writer.writeByte(@intFromEnum(info.query_kind));
+    try writer.writeByte(@backingInt(info.query_kind));
     if (info.query_kind == .NoQuery) return;
 
     try wire.writeStringBinary(writer, info.initial_user);
@@ -78,7 +78,7 @@ pub fn writeClientInfo(
         try writer.writeInt(u64, info.initial_query_start_time_microseconds, .little);
     }
 
-    try writer.writeByte(@intFromEnum(info.interface));
+    try writer.writeByte(@backingInt(info.interface));
     // Interface == TCP branch: the only interface this client emits.
     try wire.writeStringBinary(writer, info.os_user);
     try wire.writeStringBinary(writer, info.client_hostname);

@@ -54,7 +54,7 @@ pub fn build(b: *std.Build) void {
         .root_module = smoke_module,
     });
     const run_smoke = b.addRunArtifact(smoke);
-    if (b.args) |args| run_smoke.addArgs(args);
+    run_smoke.addPassthruArgs();
     const smoke_step = b.step("smoke", "Run smoke scenarios. Pass scenario via -- e.g. zig build smoke -- happy");
     smoke_step.dependOn(&run_smoke.step);
 
@@ -71,10 +71,10 @@ pub fn build(b: *std.Build) void {
 
     const smoke_readiness_step = b.step("smoke-readiness", "Run ClickHouse-backed branch-readiness smoke scenarios");
     const readiness_scenarios = [_][]const u8{
-        "pool", "pool-loop", "timeout", "read-timeout", "write-timeout",
-        "compression", "insert-compression", "insert-zstd", "nested-compressed-insert",
-        "lowcardinality", "lc-write", "json", "dynamic", "parameters",
-        "geo", "external-data", "combined-features", "column-coverage",
+        "pool",          "pool-loop",          "timeout",         "read-timeout",             "write-timeout",
+        "compression",   "insert-compression", "insert-zstd",     "nested-compressed-insert", "lowcardinality",
+        "lc-write",      "json",               "dynamic",         "parameters",               "geo",
+        "external-data", "combined-features",  "column-coverage",
     };
     for (readiness_scenarios) |scenario| {
         const run_readiness_smoke = b.addRunArtifact(smoke);

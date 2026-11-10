@@ -192,22 +192,22 @@ test "CLIENT_REVISION is sane" {
 }
 
 test "ClientPacket enum tags are stable wire bytes" {
-    try std.testing.expectEqual(@as(u64, 0), @intFromEnum(ClientPacket.Hello));
-    try std.testing.expectEqual(@as(u64, 1), @intFromEnum(ClientPacket.Query));
-    try std.testing.expectEqual(@as(u64, 4), @intFromEnum(ClientPacket.Ping));
+    try std.testing.expectEqual(@as(u64, 0), @backingInt(ClientPacket.Hello));
+    try std.testing.expectEqual(@as(u64, 1), @backingInt(ClientPacket.Query));
+    try std.testing.expectEqual(@as(u64, 4), @backingInt(ClientPacket.Ping));
 }
 
 test "ServerPacket enum tags are stable wire bytes" {
-    try std.testing.expectEqual(@as(u64, 0), @intFromEnum(ServerPacket.Hello));
-    try std.testing.expectEqual(@as(u64, 1), @intFromEnum(ServerPacket.Data));
-    try std.testing.expectEqual(@as(u64, 2), @intFromEnum(ServerPacket.Exception));
-    try std.testing.expectEqual(@as(u64, 5), @intFromEnum(ServerPacket.EndOfStream));
+    try std.testing.expectEqual(@as(u64, 0), @backingInt(ServerPacket.Hello));
+    try std.testing.expectEqual(@as(u64, 1), @backingInt(ServerPacket.Data));
+    try std.testing.expectEqual(@as(u64, 2), @backingInt(ServerPacket.Exception));
+    try std.testing.expectEqual(@as(u64, 5), @backingInt(ServerPacket.EndOfStream));
 }
 
 test "CompressionMethodByte values match wire bytes" {
-    try std.testing.expectEqual(@as(u8, 0x02), @intFromEnum(CompressionMethodByte.None));
-    try std.testing.expectEqual(@as(u8, 0x82), @intFromEnum(CompressionMethodByte.LZ4));
-    try std.testing.expectEqual(@as(u8, 0x90), @intFromEnum(CompressionMethodByte.ZSTD));
+    try std.testing.expectEqual(@as(u8, 0x02), @backingInt(CompressionMethodByte.None));
+    try std.testing.expectEqual(@as(u8, 0x82), @backingInt(CompressionMethodByte.LZ4));
+    try std.testing.expectEqual(@as(u8, 0x90), @backingInt(CompressionMethodByte.ZSTD));
 }
 
 test "client identification strings are non-empty" {

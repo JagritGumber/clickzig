@@ -86,7 +86,10 @@ pub const TlsTransport = struct {
 
         var ca_bundle_ptr: ?*std.crypto.Certificate.Bundle = null;
         var lock_ptr: ?*std.Io.RwLock = null;
-        errdefer if (ca_bundle_ptr) |b| { b.deinit(allocator); allocator.destroy(b); };
+        errdefer if (ca_bundle_ptr) |b| {
+            b.deinit(allocator);
+            allocator.destroy(b);
+        };
         errdefer if (lock_ptr) |l| allocator.destroy(l);
 
         const tls_opts: std.crypto.tls.Client.Options = blk: {
@@ -159,7 +162,10 @@ pub const TlsTransport = struct {
         self.inner.deinit();
         self.allocator.destroy(self.inner);
         self.allocator.destroy(self.tls_client);
-        if (self.ca_bundle) |b| { b.deinit(self.allocator); self.allocator.destroy(b); }
+        if (self.ca_bundle) |b| {
+            b.deinit(self.allocator);
+            self.allocator.destroy(b);
+        }
         if (self.ca_lock) |l| self.allocator.destroy(l);
     }
 

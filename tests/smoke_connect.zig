@@ -132,7 +132,10 @@ fn runExternalData(allocator: std.mem.Allocator, io: std.Io) !void {
             if (b.columns[1].column.UInt64[0] != 2) return error.ExternalDataMismatch;
         },
         .end_of_stream => break,
-        .exception => |e| { std.debug.print("[external-data] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        .exception => |e| {
+            std.debug.print("[external-data] exception: {s}\n", .{e.message});
+            return error.QueryFailed;
+        },
         else => {},
     };
     if (!seen) return error.UnexpectedRowCount;
@@ -181,7 +184,10 @@ fn runCombinedFeatures(allocator: std.mem.Allocator, io: std.Io) !void {
             if (b.columns[1].column.UInt64[0] != 2) return error.CombinedFeatureMismatch;
         },
         .end_of_stream => break,
-        .exception => |e| { std.debug.print("[combined-features] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        .exception => |e| {
+            std.debug.print("[combined-features] exception: {s}\n", .{e.message});
+            return error.QueryFailed;
+        },
         else => {},
     };
     if (!seen) return error.UnexpectedRowCount;
@@ -235,7 +241,10 @@ fn runGeo(allocator: std.mem.Allocator, io: std.Io) !void {
             if (multipoly.inner.Array.inner.Array.offsets[0] != 3) return error.GeoMismatch;
         },
         .end_of_stream => break,
-        .exception => |e| { std.debug.print("[geo] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        .exception => |e| {
+            std.debug.print("[geo] exception: {s}\n", .{e.message});
+            return error.QueryFailed;
+        },
         else => {},
     };
     if (!seen) return error.UnexpectedRowCount;
@@ -330,7 +339,10 @@ fn runGeo(allocator: std.mem.Allocator, io: std.Io) !void {
             if (b.columns[5].column.Array.inner.Array.inner.Array.offsets[0] != 3) return error.GeoMismatch;
         },
         .end_of_stream => break,
-        .exception => |e| { std.debug.print("[geo] roundtrip exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        .exception => |e| {
+            std.debug.print("[geo] roundtrip exception: {s}\n", .{e.message});
+            return error.QueryFailed;
+        },
         else => {},
     };
     if (!roundtrip_seen) return error.UnexpectedRowCount;
@@ -409,7 +421,10 @@ fn runJson(allocator: std.mem.Allocator, io: std.Io) !void {
             }
         },
         .end_of_stream => break,
-        .exception => |e| { std.debug.print("[json] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        .exception => |e| {
+            std.debug.print("[json] exception: {s}\n", .{e.message});
+            return error.QueryFailed;
+        },
         else => {},
     };
     if (!seen) return error.UnexpectedRowCount;
@@ -431,7 +446,10 @@ fn runDynamic(allocator: std.mem.Allocator, io: std.Io) !void {
             if (b.columns[0].column.len() != b.num_rows) return error.DynamicMismatch;
         },
         .end_of_stream => break,
-        .exception => |e| { std.debug.print("[dynamic] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        .exception => |e| {
+            std.debug.print("[dynamic] exception: {s}\n", .{e.message});
+            return error.QueryFailed;
+        },
         else => {},
     };
     if (rows != 2) return error.UnexpectedRowCount;
@@ -544,7 +562,10 @@ fn runLowCardinalityWrite(allocator: std.mem.Allocator, io: std.Io) !void {
         var s = try client.query("DROP TABLE IF EXISTS smoke_lc_w", arena.allocator(), null, .{});
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
-            .exception => |e| { std.debug.print("[lc-write] drop failed: {s}\n", .{e.message}); return error.SetupFailed; },
+            .exception => |e| {
+                std.debug.print("[lc-write] drop failed: {s}\n", .{e.message});
+                return error.SetupFailed;
+            },
             else => {},
         };
     }
@@ -563,15 +584,18 @@ fn runLowCardinalityWrite(allocator: std.mem.Allocator, io: std.Io) !void {
         , arena.allocator(), null, .{});
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
-            .exception => |e| { std.debug.print("[lc-write] create failed: {s}\n", .{e.message}); return error.SetupFailed; },
+            .exception => |e| {
+                std.debug.print("[lc-write] create failed: {s}\n", .{e.message});
+                return error.SetupFailed;
+            },
             else => {},
         };
     }
 
     var ks = [_]u32{ 1, 2, 3, 4, 5, 6 };
     var labels = [_][]u8{
-        @constCast("hot"), @constCast("cold"), @constCast("hot"),
-        @constCast("cold"), @constCast("hot"), @constCast("hot"),
+        @constCast("hot"),  @constCast("cold"), @constCast("hot"),
+        @constCast("cold"), @constCast("hot"),  @constCast("hot"),
     };
     var note_mask = [_]u8{ 0, 1, 0, 0, 1, 0 };
     var note_values = [_][]u8{
@@ -628,7 +652,10 @@ fn runLowCardinalityWrite(allocator: std.mem.Allocator, io: std.Io) !void {
             seen += @intCast(b.num_rows);
         },
         .end_of_stream => break,
-        .exception => |e| { std.debug.print("[lc-write] select failed: {s}\n", .{e.message}); return error.QueryFailed; },
+        .exception => |e| {
+            std.debug.print("[lc-write] select failed: {s}\n", .{e.message});
+            return error.QueryFailed;
+        },
         else => {},
     };
     if (seen != 6) return error.UnexpectedRowCount;
@@ -650,7 +677,10 @@ fn runLowCardinality(allocator: std.mem.Allocator, io: std.Io) !void {
         var s = try client.query("DROP TABLE IF EXISTS smoke_lc", arena.allocator(), null, .{});
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
-            .exception => |e| { std.debug.print("[lc] drop failed: {s}\n", .{e.message}); return error.SetupFailed; },
+            .exception => |e| {
+                std.debug.print("[lc] drop failed: {s}\n", .{e.message});
+                return error.SetupFailed;
+            },
             else => {},
         };
     }
@@ -664,7 +694,10 @@ fn runLowCardinality(allocator: std.mem.Allocator, io: std.Io) !void {
         , arena.allocator(), null, .{});
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
-            .exception => |e| { std.debug.print("[lc] create failed: {s}\n", .{e.message}); return error.SetupFailed; },
+            .exception => |e| {
+                std.debug.print("[lc] create failed: {s}\n", .{e.message});
+                return error.SetupFailed;
+            },
             else => {},
         };
     }
@@ -679,7 +712,10 @@ fn runLowCardinality(allocator: std.mem.Allocator, io: std.Io) !void {
         , arena.allocator(), null, .{});
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
-            .exception => |e| { std.debug.print("[lc] insert-select failed: {s}\n", .{e.message}); return error.SetupFailed; },
+            .exception => |e| {
+                std.debug.print("[lc] insert-select failed: {s}\n", .{e.message});
+                return error.SetupFailed;
+            },
             else => {},
         };
     }
@@ -713,7 +749,10 @@ fn runLowCardinality(allocator: std.mem.Allocator, io: std.Io) !void {
             seen += @intCast(b.num_rows);
         },
         .end_of_stream => break,
-        .exception => |e| { std.debug.print("[lc] select failed: {s}\n", .{e.message}); return error.QueryFailed; },
+        .exception => |e| {
+            std.debug.print("[lc] select failed: {s}\n", .{e.message});
+            return error.QueryFailed;
+        },
         else => {},
     };
     if (seen != 20) return error.UnexpectedRowCount;
@@ -748,7 +787,10 @@ fn runCompression(allocator: std.mem.Allocator, io: std.Io) !void {
             }
         },
         .end_of_stream => break,
-        .exception => |e| { std.debug.print("[compression] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        .exception => |e| {
+            std.debug.print("[compression] exception: {s}\n", .{e.message});
+            return error.QueryFailed;
+        },
         else => {},
     };
     if (rows != 100) return error.UnexpectedRowCount;
@@ -788,7 +830,10 @@ fn runTupleMap(allocator: std.mem.Allocator, io: std.Io) !void {
             rows += b.num_rows;
         },
         .end_of_stream => break,
-        .exception => |e| { std.debug.print("[tuple-map] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        .exception => |e| {
+            std.debug.print("[tuple-map] exception: {s}\n", .{e.message});
+            return error.QueryFailed;
+        },
         else => {},
     };
     if (rows != 2) return error.UnexpectedRowCount;
@@ -820,7 +865,10 @@ fn runDecimalIp(allocator: std.mem.Allocator, io: std.Io) !void {
             if (price_raw != 12345) return error.DecimalMismatch;
         },
         .end_of_stream => break,
-        .exception => |e| { std.debug.print("[decimal-ip] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        .exception => |e| {
+            std.debug.print("[decimal-ip] exception: {s}\n", .{e.message});
+            return error.QueryFailed;
+        },
         else => {},
     };
     std.debug.print("[decimal-ip] OK\n", .{});
@@ -857,7 +905,10 @@ fn runColumnCoverage(allocator: std.mem.Allocator, io: std.Io) !void {
             if (interval_day != 3) return error.IntervalMismatch;
         },
         .end_of_stream => break,
-        .exception => |e| { std.debug.print("[column-coverage] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        .exception => |e| {
+            std.debug.print("[column-coverage] exception: {s}\n", .{e.message});
+            return error.QueryFailed;
+        },
         else => {},
     };
     if (!seen) return error.UnexpectedRowCount;
@@ -984,7 +1035,10 @@ fn runComplexTypes(allocator: std.mem.Allocator, io: std.Io) !void {
             rows += b.num_rows;
         },
         .end_of_stream => break,
-        .exception => |e| { std.debug.print("[complex] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        .exception => |e| {
+            std.debug.print("[complex] exception: {s}\n", .{e.message});
+            return error.QueryFailed;
+        },
         else => {},
     };
     if (rows != 2) return error.UnexpectedRowCount;
@@ -1027,7 +1081,10 @@ fn runNullableRoundtrip(allocator: std.mem.Allocator, io: std.Io) !void {
             rows_seen += b.num_rows;
         },
         .end_of_stream => break,
-        .exception => |e| { std.debug.print("[nullable] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        .exception => |e| {
+            std.debug.print("[nullable] exception: {s}\n", .{e.message});
+            return error.QueryFailed;
+        },
         else => {},
     };
     if (rows_seen != 5) return error.UnexpectedRowCount;
@@ -1065,7 +1122,10 @@ fn runInsertCompression(allocator: std.mem.Allocator, io: std.Io, method: clickz
         var s = try client.query(sql, arena.allocator(), null, compressed_opts);
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
-            .exception => |e| { std.debug.print("[{s}] drop failed: {s}\n", .{ label, e.message }); return error.SetupFailed; },
+            .exception => |e| {
+                std.debug.print("[{s}] drop failed: {s}\n", .{ label, e.message });
+                return error.SetupFailed;
+            },
             else => {},
         };
     }
@@ -1074,7 +1134,10 @@ fn runInsertCompression(allocator: std.mem.Allocator, io: std.Io, method: clickz
         var s = try client.query(sql, arena.allocator(), null, compressed_opts);
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
-            .exception => |e| { std.debug.print("[{s}] create failed: {s}\n", .{ label, e.message }); return error.SetupFailed; },
+            .exception => |e| {
+                std.debug.print("[{s}] create failed: {s}\n", .{ label, e.message });
+                return error.SetupFailed;
+            },
             else => {},
         };
     }
@@ -1119,7 +1182,10 @@ fn runInsertCompression(allocator: std.mem.Allocator, io: std.Io, method: clickz
             rows_seen += @intCast(b.num_rows);
         },
         .end_of_stream => break,
-        .exception => |e| { std.debug.print("[{s}] select failed: {s}\n", .{ label, e.message }); return error.QueryFailed; },
+        .exception => |e| {
+            std.debug.print("[{s}] select failed: {s}\n", .{ label, e.message });
+            return error.QueryFailed;
+        },
         else => {},
     };
     if (rows_seen != 100) {
@@ -1212,7 +1278,10 @@ fn runNestedCompressedInsert(allocator: std.mem.Allocator, io: std.Io) !void {
             if (attrs.values.Nullable.mask[1] != 1 or attrs.values.Nullable.inner.UInt32[2] != 300) return error.NestedCompressedMismatch;
         },
         .end_of_stream => break,
-        .exception => |e| { std.debug.print("[nested-compressed-insert] exception: {s}\n", .{e.message}); return error.QueryFailed; },
+        .exception => |e| {
+            std.debug.print("[nested-compressed-insert] exception: {s}\n", .{e.message});
+            return error.QueryFailed;
+        },
         else => {},
     };
     if (rows != 2) return error.UnexpectedRowCount;
@@ -1233,7 +1302,10 @@ fn runInsertRoundtrip(allocator: std.mem.Allocator, io: std.Io) !void {
         var s = try client.query("DROP TABLE IF EXISTS smoke_roundtrip", arena.allocator(), null, .{});
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
-            .exception => |e| { std.debug.print("[insert] drop failed: {s}\n", .{e.message}); return error.SetupFailed; },
+            .exception => |e| {
+                std.debug.print("[insert] drop failed: {s}\n", .{e.message});
+                return error.SetupFailed;
+            },
             else => {},
         };
     }
@@ -1241,7 +1313,10 @@ fn runInsertRoundtrip(allocator: std.mem.Allocator, io: std.Io) !void {
         var s = try client.query("CREATE TABLE smoke_roundtrip (id UInt32, label String) ENGINE = Memory", arena.allocator(), null, .{});
         while (try s.next()) |p| switch (p) {
             .end_of_stream => break,
-            .exception => |e| { std.debug.print("[insert] create failed: {s}\n", .{e.message}); return error.SetupFailed; },
+            .exception => |e| {
+                std.debug.print("[insert] create failed: {s}\n", .{e.message});
+                return error.SetupFailed;
+            },
             else => {},
         };
     }
@@ -1281,7 +1356,10 @@ fn runInsertRoundtrip(allocator: std.mem.Allocator, io: std.Io) !void {
             rows_seen += @intCast(b.num_rows);
         },
         .end_of_stream => break,
-        .exception => |e| { std.debug.print("[insert] select failed: {s}\n", .{e.message}); return error.QueryFailed; },
+        .exception => |e| {
+            std.debug.print("[insert] select failed: {s}\n", .{e.message});
+            return error.QueryFailed;
+        },
         else => {},
     };
     if (rows_seen != 3) {

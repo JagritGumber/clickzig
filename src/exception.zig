@@ -44,11 +44,7 @@ pub const Error = error{
 pub fn readException(
     reader: *std.Io.Reader,
     allocator: std.mem.Allocator,
-) (std.Io.Reader.Error
-    || std.Io.Reader.ReadAllocError
-    || @import("varint.zig").Error
-    || wire.Error
-    || Error)!cherror.ServerError {
+) (std.Io.Reader.Error || std.Io.Reader.ReadAllocError || @import("varint.zig").Error || wire.Error || Error)!cherror.ServerError {
     const code_i32 = try reader.takeInt(i32, .little);
 
     const name = try wire.readStringOwned(reader, allocator, MAX_EXCEPTION_STRING);

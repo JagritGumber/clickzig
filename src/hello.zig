@@ -327,7 +327,7 @@ test "readHelloResult routes Exception packet to server_exception" {
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     // Exception packet body: code, name, message, stack, has_nested
-    try varint.writeVarUInt(&w, @intFromEnum(protocol.ServerPacket.Exception));
+    try varint.writeVarUInt(&w, @backingInt(protocol.ServerPacket.Exception));
     try w.writeInt(i32, 194, .little);
     try wire.writeStringBinary(&w, "DB::Exception");
     try wire.writeStringBinary(&w, "Required password");

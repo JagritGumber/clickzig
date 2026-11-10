@@ -1,8 +1,8 @@
 .{
     .name = .clickzig,
-    .version = "0.16.0",
+    .version = "0.17.0",
     .fingerprint = 0x5491b43e7a7baa19,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     .paths = .{
         "src",

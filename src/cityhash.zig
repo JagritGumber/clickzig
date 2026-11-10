@@ -285,9 +285,14 @@ test "cityhash128 of 'a'" {
 }
 
 test "cityhash128 of long input is deterministic" {
-    const data = "The quick brown fox jumps over the lazy dog. " ** 8;
-    const h1 = cityhash128(data);
-    const h2 = cityhash128(data);
+    const sentence = "The quick brown fox jumps over the lazy dog. ";
+    const data = comptime blk: {
+        var buf: [sentence.len * 8]u8 = undefined;
+        for (0..8) |i| @memcpy(buf[i * sentence.len ..][0..sentence.len], sentence);
+        break :blk buf;
+    };
+    const h1 = cityhash128(&data);
+    const h2 = cityhash128(&data);
     try testing.expectEqual(h1.low, h2.low);
     try testing.expectEqual(h1.high, h2.high);
 }

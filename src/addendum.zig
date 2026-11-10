@@ -62,14 +62,12 @@ pub fn writeClientAddendum(
 /// True if the server's reported send-side chunking choice means
 /// server→client data is being framed in chunks.
 pub fn isChunkedSendEngaged(server_send_chunked_srv: []const u8) bool {
-    return std.mem.eql(u8, server_send_chunked_srv, "chunked")
-        or std.mem.eql(u8, server_send_chunked_srv, "chunked_optional");
+    return std.mem.eql(u8, server_send_chunked_srv, "chunked") or std.mem.eql(u8, server_send_chunked_srv, "chunked_optional");
 }
 
 /// Same, for client→server direction.
 pub fn isChunkedRecvEngaged(server_recv_chunked_srv: []const u8) bool {
-    return std.mem.eql(u8, server_recv_chunked_srv, "chunked")
-        or std.mem.eql(u8, server_recv_chunked_srv, "chunked_optional");
+    return std.mem.eql(u8, server_recv_chunked_srv, "chunked") or std.mem.eql(u8, server_recv_chunked_srv, "chunked_optional");
 }
 
 // --- tests -----------------------------------------------------------------
