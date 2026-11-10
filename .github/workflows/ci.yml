@@ -113,3 +113,7 @@ jobs:
         run: zig build smoke -- lc-write
       - name: branch-readiness smoke aggregate
         run: zig build smoke-readiness
+      - name: smoke async (cancellation + concurrency)
+        run: zig build smoke-async -- all
+      - name: example 06 concurrent queries
+        run: zig build run-06-concurrent-queries

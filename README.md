@@ -8,22 +8,23 @@
 
 <h1 align="center">clickzig</h1>
 
-<h3 align="center">Native ClickHouse TCP for Zig 0.16.0</h3>
+<h3 align="center">Native ClickHouse TCP for Zig 0.17</h3>
 
 <p align="center">
-  Streaming queries, Native INSERT, compression, pooling, TLS, parameters, external data, and broad ClickHouse type coverage.
+  Async-ready over <code>std.Io</code>: streaming queries, Native INSERT, compression, pooling, TLS, parameters, external data, and broad ClickHouse type coverage.
 </p>
 
 <p align="center">
   <a href="https://github.com/JagritGumber/clickzig/actions/workflows/ci.yml"><img src="https://github.com/JagritGumber/clickzig/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/Zig-0.16.0-F7A41D?logo=zig&logoColor=white" alt="Zig 0.16.0">
+  <img src="https://img.shields.io/badge/Zig-0.17-F7A41D?logo=zig&logoColor=white" alt="Zig 0.17">
   <img src="https://img.shields.io/badge/ClickHouse-26.3%20tested-FFCC01?logo=clickhouse&logoColor=black" alt="ClickHouse 26.3 tested">
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0">
 </p>
 
 ## at a glance
 
-- ✅ **Supported for Zig 0.16.0** - `main` and `0.16.0` track the maintained Zig 0.16 line.
+- ✅ **Supported for Zig 0.17** - `main` tracks Zig 0.17; the `0.16.0` branch keeps the Zig 0.16 line.
+- 🔀 **Async via `std.Io`** - run queries concurrently with `io.async` / `io.concurrent` / `Io.Group`; cancel with `Future.cancel`, and clickzig tells the server to stop (protocol `Cancel`) while keeping the connection reusable.
 - ⚡ **Native protocol** - talks ClickHouse TCP directly on `9000` or `9440` for TLS.
 - 📡 **Streaming queries** - `Client.query()` returns a `ResultStream` over Data, Progress, Logs, Totals, Extremes, Exceptions, and EndOfStream.
 - 📥 **Native INSERT** - bulk column-oriented INSERT with caller-owned buffers and explicit type names.
@@ -31,16 +32,16 @@
 - 📦 **External tables** - send named Native blocks alongside a query.
 - 🗜️ **Compression** - LZ4 and ZSTD read/write frames, opt-in by config or per query.
 - 🔐 **TLS + transports** - built-in TCP/TLS transports, plus a vtable for custom backends.
-- 🧵 **Pool** - thread-safe acquire/release with broken-connection discard and lifetime expiry.
+- 🧵 **Pool** - `std.Io`-safe acquire/release (threads or tasks), cancelable waits, broken-connection discard, and lifetime expiry.
 - 🧬 **Type coverage** - primitives, Nullable, Array, Tuple, Map, Decimal, LowCardinality, JSON, Dynamic, Sparse, Geo aliases, and common ClickHouse aliases.
 - 🛡️ **Security hardening** - allocation caps, timeout mapping, hostile-frame audit probes, and compression checksum validation.
-- 🧪 **CI-backed smoke tests** - live ClickHouse tests cover compression, parameters, external data, pool, timeouts, and combined scenarios.
+- 🧪 **CI-backed smoke tests** - live ClickHouse tests cover compression, parameters, external data, pool, timeouts, cancellation, concurrency, and combined scenarios.
 
-Versioning follows the Karl Seguin-style Zig package convention: branches target Zig compiler lines, not a normal semver release train. Package metadata is pinned to Zig 0.16.0 (`build.zig.zon` + `.zigversion`). The `0.16.0` branch is the long-lived Zig 0.16 line; a future `dev` branch may track Zig development snapshots.
+Versioning follows the Karl Seguin-style Zig package convention: branches target Zig compiler lines, not a normal semver release train. Package metadata is pinned to Zig 0.17 (`build.zig.zon` + `.zigversion`). The `0.16.0` branch is the long-lived Zig 0.16 line; a future `dev` branch may track Zig development snapshots.
 
-## intentional non-goals for v0.16.0
+## intentional non-goals
 
-- **Async via `std.Io` fibers** — current API is sync. Iterator-first stream contract is locked so the column-store decoder doesn't fight the API later.
+- **Multiplexing several queries over one connection** — the ClickHouse native protocol serves one query per connection at a time. Concurrency comes from several connections (`Pool`), not from interleaving on one.
 - **SQL placeholder rewriting** — Go-style `?`, `$1`, and `@name` client-side rewriting is intentionally not implemented. Use native ClickHouse `{name:Type}` placeholders through `QueryOptions.parameters`.
 
 ## design decisions worth knowing up front
@@ -49,8 +50,9 @@ Versioning follows the Karl Seguin-style Zig package convention: branches target
 - **Transport interface, not concrete `Stream`.** `Client` holds a vtable. Built-in `TcpTransport` covers TCP/DNS; alternate backends or test mocks drop in without touching Client code.
 - **Iterator-first query shape.** `Client.query()` returns a `ResultStream` with `next() !?Packet`, so callers can stream Data, Progress, Log, Totals, Extremes, and Exception packets without buffering the full result.
 - **Lifecycle observability built in.** `Config.on_event` fires at every state transition (connecting, hello_sent, pong_received, ...). Default null = zero overhead. Layer metrics or OTel adapters on top without library changes.
-- **Single-thread per Client.** State machine is non-atomic by design. Use one Client per thread or the built-in `Pool` for multi-threaded workloads.
-- **Cancellation via `*const std.atomic.Value(bool)`.** Polled at every I/O boundary in Client methods. Zig 0.16's `Future.cancel` is async-task-bound; for a sync API the atomic-bool is the right primitive.
+- **`std.Io` all the way down.** Every blocking step (dial, read, write, timeouts, pool waits) goes through the `Io` you pass in, so the same code is synchronous on `Io.Threaded` and concurrent under `io.async` / `io.concurrent` / `Io.Group`. Read/write timeouts use `Io.Batch` operations rather than helper tasks.
+- **One in-flight call per Client.** The state machine is non-atomic by design. Give each concurrent task its own Client, or share a `Pool`.
+- **Cancellation is `Io` cancellation.** `future.cancel(io)` / `group.cancel(io)` surfaces as `error.Canceled`. If the client was waiting for the next server packet it sends a protocol `Cancel`, drains the reply (bounded by `cancel_drain_timeout_ms`), and stays reusable; `ResultStream.cancel()` does the same when you just want to stop reading early.
 
 ## install
 
@@ -60,7 +62,7 @@ Depend on the branch that matches your Zig compiler:
 zig fetch --save git+https://github.com/<owner>/clickzig#main
 ```
 
-`main` targets Zig 0.16.0. Use the `0.16.0` branch for the maintained Zig 0.16 line. A future `dev` branch may target Zig development snapshots.
+`main` targets Zig 0.17. Use the `0.16.0` branch for the maintained Zig 0.16 line. A future `dev` branch may target Zig development snapshots.
 
 ## quick start: query
 
@@ -141,6 +143,29 @@ defer pool.release(client);
 try client.ping();
 ```
 
+## quick start: async
+
+```zig
+// Fan out over a pool: each task gets its own connection.
+var group: std.Io.Group = .init;
+defer group.cancel(io);
+for (&jobs) |*job| group.async(io, runJob, .{ pool, gpa, job });
+try group.await(io);
+
+// Deadline: cancel a slow query after 500ms. The server stops it too,
+// and the connection goes back to the pool ready for reuse.
+var slow = try io.concurrent(slowQuery, .{ pool, gpa });
+try (std.Io.Clock.Duration{ .raw = .fromMilliseconds(500), .clock = .awake }).sleep(io);
+_ = slow.cancel(io) catch |e| switch (e) {
+    error.Canceled => {},
+    else => return e,
+};
+```
+
+Use `io.concurrent` (not `io.async`) when the caller must keep running while the task waits: `io.async` is allowed to run the task inline. See `examples/06_concurrent_queries.zig` for the full program.
+
+> **Backend note (Zig 0.17.1):** `std.Io.Evented` (io_uring / kqueue) does not implement TCP networking yet — connect, `net_read`, and `net_write` are still `TODO` in std. Use `Io.Threaded`, which runs `async`/`concurrent` tasks on a thread pool and supports cancellation. clickzig only talks to the `Io` interface, so evented backends will work once std implements their networking.
+
 ## quick start: dsn
 
 ```zig
@@ -157,15 +182,16 @@ defer client.close();
 
 ## examples
 
-Five focused, copy-pasteable examples in `examples/`. Each demonstrates one concept in isolation:
+Six focused, copy-pasteable examples in `examples/`. Each demonstrates one concept in isolation:
 
 | | example | what it shows | run |
 |---|---|---|---|
 | 01 | `01_connect.zig` | minimal happy path | `zig build run-01-connect` |
 | 02 | `02_diagnostics.zig` | catch `error.AuthenticationFailed`, inspect the server's parsed `ServerError` | `zig build run-02-diagnostics` |
 | 03 | `03_observability.zig` | wire `Config.on_event` to log every lifecycle transition | `zig build run-03-observability` |
-| 04 | `04_health_check.zig` | ping loop with cross-thread cancellation token | `zig build run-04-health-check` |
+| 04 | `04_health_check.zig` | ping loop in an `io.concurrent` task, stopped with `Future.cancel` | `zig build run-04-health-check` |
 | 05 | `05_custom_transport.zig` | plug a `MemTransport` (canned bytes) into `Client.fromTransport` | `zig build run-05-custom-transport` |
+| 06 | `06_concurrent_queries.zig` | `Pool` + `Io.Group` fan-out, and a query deadline via `Future.cancel` | `zig build run-06-concurrent-queries` |
 
 `zig build examples` compiles all of them as a smoke check.
 
@@ -194,7 +220,7 @@ Connect errors are typed and granular. The OS-level cause flows into specific `C
 | `ReadTimeout` | established socket read exceeded `read_timeout_ms` |
 | `WriteTimeout` | established socket write exceeded `write_timeout_ms` |
 | `ProtocolError` | malformed wire bytes (overlong varint, unexpected packet, length cap) |
-| `Cancelled` | caller's atomic bool flipped mid-handshake |
+| `Canceled` | the calling `std.Io` task was canceled (`Future.cancel` / `Group.cancel`) |
 | `ConnectionFailed` | catch-all for unmapped OS errors |
 
 ## porting from other clients
@@ -240,6 +266,9 @@ zig build test
 
 # end-to-end smoke against a running ClickHouse on localhost:9000
 zig build smoke -- <scenario>
+
+# async + cancellation scenarios (cancel-query, stream-cancel, cancel-race, pool-cancel, fanout)
+zig build smoke-async -- all
 ```
 
 Scenarios: `happy`, `ping`, `wrong-pass`, `unreachable`, `wrong-host`, `query-bytes`, `query-mixed`, `insert-roundtrip`, `nullable-roundtrip`, `complex-types`, `tuple-map`, `decimal-ip`, `column-coverage`, `pool`, `pool-loop`, `dsn`, `compression`, `insert-compression`, `insert-zstd`, `nested-compressed-insert`, `lowcardinality`, `lc-write`, `timeout`, `read-timeout`, `write-timeout`, `json`, `dynamic`, `parameters`, `geo`, `external-data`, `combined-features`.
@@ -248,7 +277,7 @@ The smoke harness assumes `clickhouse/clickhouse-server:26.3` running locally wi
 
 ### branch policy
 
-`main` targets the latest supported stable Zig line for this repository: currently Zig 0.16.0. The `0.16.0` branch is the maintained Zig 0.16 line. A future `dev` branch may track Zig development snapshots. Do not create GitHub Releases or semver tag trains for normal development.
+`main` targets the latest supported stable Zig line for this repository: currently Zig 0.17. The `0.16.0` branch is the maintained Zig 0.16 line. A future `dev` branch may track Zig development snapshots. Do not create GitHub Releases or semver tag trains for normal development.
 
 ## license
 

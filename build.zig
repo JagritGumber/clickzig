@@ -108,6 +108,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "03-observability", .path = "examples/03_observability.zig" },
         .{ .name = "04-health-check", .path = "examples/04_health_check.zig" },
         .{ .name = "05-custom-transport", .path = "examples/05_custom_transport.zig" },
+        .{ .name = "06-concurrent-queries", .path = "examples/06_concurrent_queries.zig" },
     };
     for (example_files) |ex| {
         const ex_module = b.createModule(.{

@@ -54,6 +54,7 @@ Important fields:
 | `dial_timeout_ms` | `30000` | TCP connect timeout; `0` means infinite |
 | `read_timeout_ms` | `60000` | socket read timeout; `0` means infinite |
 | `write_timeout_ms` | `30000` | socket write timeout; `0` means infinite |
+| `cancel_drain_timeout_ms` | `5000` | read budget for draining the server after a canceled query sends `Cancel` |
 | `settings` | null | per-client default ClickHouse settings |
 | `compression` | `.Disable` | opt-in wire compression |
 | `compression_method` | `.lz4` | write method when compression is enabled |
@@ -70,14 +71,11 @@ const client = try clickzig.Client.connectTcp(cfg, io, diag);
 defer client.close();
 ```
 
-`cancel` is an optional `*const std.atomic.Value(bool)`. If it flips to `true`
-before or during a supported I/O boundary, the operation returns
-`error.Cancelled`.
-
 `diag` is an optional `*clickzig.Diagnostics`. On handshake exceptions it can
 hold a parsed `ServerError`.
 
-One `Client` is not thread-safe. Use one client per thread or `clickzig.Pool`.
+One `Client` serves one in-flight call at a time and is not thread-safe. Give
+each concurrent task its own client, or share a `clickzig.Pool`.
 
 ## Query
 
@@ -212,6 +210,50 @@ The `type_name` string must match the server schema. Aliases such as `Date`,
 `DateTime64(3)`, `Enum8(...)`, `LowCardinality(String)`, and `Nullable(UInt64)`
 must be passed as the original ClickHouse type string.
 
+## Async and cancellation
+
+Every blocking step goes through the `std.Io` passed to `connectTcp` /
+`Pool.init`. Run calls concurrently with the usual `std.Io` tools:
+
+```zig
+// Concurrent fan-out over a pool.
+var group: std.Io.Group = .init;
+defer group.cancel(io);
+for (&jobs) |*job| group.async(io, runJob, .{ pool, gpa, job });
+try group.await(io);
+
+// A task that must make progress while the caller keeps going.
+var task = try io.concurrent(runQuery, .{ client, gpa });
+const result = task.await(io); // or task.cancel(io)
+```
+
+`io.async` may run the task inline to completion when no worker is free; use
+`io.concurrent` when the caller depends on the task running in parallel (for
+example, a deadline that sleeps and then cancels).
+
+Cancellation is `std.Io` cancellation. `future.cancel(io)` or
+`group.cancel(io)` makes the pending operation return `error.Canceled`, which
+every clickzig call propagates unchanged:
+
+| canceled while... | result |
+|---|---|
+| dialing / handshaking | `error.Canceled`; no client is returned |
+| before a query or ping wrote anything | `error.Canceled`; client stays `.ready` |
+| waiting for the next server packet | client sends protocol `Cancel`, drains to EndOfStream/Exception (bounded by `Config.cancel_drain_timeout_ms`, shielded from further cancels), returns `error.Canceled` with the client `.ready` |
+| in the middle of reading or writing a packet | `error.Canceled`; client is `.broken` |
+| waiting in `Pool.acquire` | `error.Canceled`; no pool slot is consumed |
+
+Check `client.isReusable()` after a cancel; `Pool.release` does this for you.
+
+To stop reading a result early without canceling the task, call
+`stream.cancel()`. It sends `Cancel`, drains, and returns the client to
+`.ready` (or `.broken` if the server does not wind down in time).
+
+Backend support (Zig 0.17.1): `std.Io.Threaded` implements networking,
+`async`/`concurrent`, and cancellation. `std.Io.Evented` (io_uring / kqueue)
+does not implement TCP connect or socket reads/writes yet, so it cannot drive
+clickzig until std fills that in.
+
 ## Pool
 
 ```zig
@@ -227,7 +269,9 @@ try client.ping();
 ```
 
 The pool recycles clients only when `client.isReusable()` is true. Broken or
-expired clients are closed instead of returned to the idle list.
+expired clients are closed instead of returned to the idle list. The pool's
+mutex and condition are `std.Io` primitives, so it can be shared between
+threads or `std.Io` tasks, and `acquire()` is a cancellation point.
 
 ## TLS
 

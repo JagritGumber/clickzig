@@ -38,6 +38,7 @@ Run these with ClickHouse:
 ```bash
 zig build smoke-compression
 zig build smoke-readiness
+zig build smoke-async -- all
 ```
 
 Focused smoke scenario:
@@ -82,6 +83,15 @@ Current scenarios:
 - `external-data`
 - `combined-features`
 
+Async scenarios (`zig build smoke-async -- <scenario>`, default `all`):
+
+- `cancel-query` — cancel a long query from another task; the server must stop
+  it and the client must stay reusable
+- `stream-cancel` — `ResultStream.cancel()` after the first block
+- `cancel-race` — cancels at varying delays; every outcome must be clean
+- `pool-cancel` — cancel a task blocked in `Pool.acquire`
+- `fanout` — many concurrent queries through a `Pool` with `Io.Group`
+
 `smoke-readiness` runs the release-confidence subset that exercises pooling,
 timeouts, compression, custom types, external data, parameters, and combined
 feature interactions.
@@ -96,6 +106,7 @@ zig build audit --summary all
 zig build examples --summary all
 zig build smoke-compression
 zig build smoke-readiness
+zig build smoke-async -- all
 ```
 
 CI should run the ClickHouse-backed steps against a service container exposing
@@ -103,8 +114,9 @@ native port `9000` with user `default` and password `test`.
 
 ## Pooling
 
-`Pool` is intended for multi-threaded applications that need more than one
-in-flight operation. A single `Client` is not thread-safe.
+`Pool` is intended for applications with more than one in-flight operation,
+whether they come from OS threads or `std.Io` tasks (`io.async`,
+`io.concurrent`, `Io.Group`). A single `Client` serves one call at a time.
 
 ```zig
 const pool = try clickzig.Pool.init(allocator, io, cfg, .{
@@ -119,7 +131,8 @@ defer pool.release(client);
 
 Pool behavior:
 
-- `acquire(null)` waits for or creates a reusable connection.
+- `acquire()` waits for or creates a reusable connection; canceling the
+  waiting task returns `error.Canceled` without consuming a slot.
 - `release(client)` recycles ready clients and closes broken clients.
 - expired clients are retired according to `max_lifetime_ms`.
 - callers must not use a client after releasing it.
@@ -140,8 +153,15 @@ Timeouts are configured on `Config` in milliseconds:
 - `error.ReadTimeout`
 - `error.WriteTimeout`
 
-The built-in `TcpTransport` implements timeout-aware dial/read/write behavior
-without relying on Zig 0.16's panicking TCP connect timeout path.
+The built-in `TcpTransport` enforces read/write timeouts with `std.Io.Batch`
+operations (`net_read` / `net_write` awaited with a timeout, then canceled), so
+no helper tasks are spawned per I/O call. Dial timeouts race the connect
+against a timer because Zig 0.17.1's threaded backend still panics when
+`connect` is given a timeout directly.
+
+A canceled query is aborted in-band: the client sends a protocol `Cancel` and
+drains the reply within `cancel_drain_timeout_ms` (default 5 s). Tune it if
+your server takes longer to stop heavy queries.
 
 ## TLS
 
@@ -159,7 +179,7 @@ local development and self-signed smoke setups only.
 ## Branch policy
 
 `main` targets the current stable Zig line for this package, currently Zig
-0.16.0. The `0.16.0` branch is the maintained Zig 0.16 line. Future Zig
+0.17. The `0.16.0` branch is the maintained Zig 0.16 line. Future Zig
 development snapshots can use a `dev` branch when needed.
 
 Do not create release tags, GitHub Releases, or publish artifacts unless the

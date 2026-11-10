@@ -1,11 +1,11 @@
 # Getting started
 
-clickzig is a native-protocol ClickHouse client for Zig 0.16.0. It talks to the
+clickzig is a native-protocol ClickHouse client for Zig 0.17. It talks to the
 ClickHouse TCP port directly: `9000` for plain TCP and `9440` for TLS.
 
 ## Requirements
 
-- Zig 0.16.0
+- Zig 0.17 (use the `0.16.0` branch for Zig 0.16)
 - A ClickHouse server for smoke tests
 - Native protocol credentials; the repository smoke tests assume user
   `default`, password `test`, host `127.0.0.1`, and port `9000`
@@ -15,7 +15,7 @@ ClickHouse TCP port directly: `9000` for plain TCP and `9440` for TLS.
 During development, depend on the branch that matches your Zig compiler:
 
 ```bash
-zig fetch --save git+https://github.com/JagritGumber/clickzig#0.16.0
+zig fetch --save git+https://github.com/JagritGumber/clickzig#main
 ```
 
 Then import the module from your `build.zig`:
