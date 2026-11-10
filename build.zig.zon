@@ -8,6 +8,7 @@
         "src",
         "tests",
         "examples",
+        "bench",
         "build.zig",
         "build.zig.zon",
         ".zigversion",

@@ -35,6 +35,7 @@
 - 🧵 **Pool** - `std.Io`-safe acquire/release (threads or tasks), cancelable waits, broken-connection discard, and lifetime expiry.
 - 🧬 **Type coverage** - primitives, Nullable, Array, Tuple, Map, Decimal, LowCardinality, JSON, Dynamic, Sparse, Geo aliases, and common ClickHouse aliases.
 - 🛡️ **Security hardening** - allocation caps, timeout mapping, hostile-frame audit probes, and compression checksum validation.
+- 🏎️ **Fast** - on par with or ahead of the C++ `clickhouse-client` on most read scans; see [benchmarks](#benchmarks).
 - 🧪 **CI-backed smoke tests** - live ClickHouse tests cover compression, parameters, external data, pool, timeouts, cancellation, concurrency, and combined scenarios.
 
 Versioning follows the Karl Seguin-style Zig package convention: branches target Zig compiler lines, not a normal semver release train. Package metadata is pinned to Zig 0.17 (`build.zig.zon` + `.zigversion`). The `0.16.0` branch is the long-lived Zig 0.16 line; a future `dev` branch may track Zig development snapshots.
@@ -194,6 +195,31 @@ Six focused, copy-pasteable examples in `examples/`. Each demonstrates one conce
 | 06 | `06_concurrent_queries.zig` | `Pool` + `Io.Group` fan-out, and a query deadline via `Future.cancel` | `zig build run-06-concurrent-queries` |
 
 `zig build examples` compiles all of them as a smoke check.
+
+## benchmarks
+
+<p align="center"><img src="assets/benchmarks.svg" alt="clickzig benchmark results: read throughput vs clickhouse-client, concurrent query scaling, ping latency, insert throughput" width="880"></p>
+
+| workload | clickzig | clickhouse-client (C++) |
+|---|---:|---:|
+| UInt64 scan (20M rows) | 467.9M rows/s | 454.5M rows/s |
+| UInt64 scan + LZ4 | 129.8M rows/s | 114.9M rows/s |
+| String scan (5M rows) | 91.2M rows/s | 83.3M rows/s |
+| String scan + LZ4 | 57.1M rows/s | 62.5M rows/s |
+| INSERT 100k rows × 3 cols, Null engine | 1.7M rows/s | 1.6M rows/s |
+
+Concurrent queries over a `Pool` (workers → queries/s): 1→101 · 2→152 · 4→216 · 8→265 · 16→266. Ping round trip p50 19 µs, p99 40 µs.
+
+Zig 0.17.1 · ClickHouse 26.3 · AMD Ryzen 7 7840HS (16 threads) · Linux · Io.Threaded. Loopback TCP with client and server in the same container, so these numbers show client overhead, not network speed. `clickhouse-client` is a reference point rather than a strict head-to-head: it also re-encodes the Native output it receives. INSERT is server-bound, so both clients land at the same rate whatever the compression.
+
+Reproduce (ClickHouse on `127.0.0.1:9000`, `default:test`):
+
+```bash
+zig build bench -Doptimize=ReleaseFast > run1.jsonl         # repeat for run2, run3
+sh bench/reference_clickhouse_client.sh > ref.jsonl         # inside the ClickHouse container
+python3 bench/collect.py --env "<machine>" --reference ref.jsonl run*.jsonl > bench/results.json
+python3 bench/plot.py bench/results.json assets/benchmarks.svg
+```
 
 ## documentation
 

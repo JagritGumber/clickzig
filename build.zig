@@ -97,6 +97,23 @@ pub fn build(b: *std.Build) void {
         smoke_readiness_step.dependOn(&run_readiness_smoke.step);
     }
 
+    // Benchmarks against a live ClickHouse. Build with
+    // `-Doptimize=ReleaseFast`; see bench/plot.py for the SVG.
+    const bench_module = b.createModule(.{
+        .root_source_file = b.path("bench/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_module.addImport("clickzig", clickzig_module);
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = bench_module,
+    });
+    const run_bench = b.addRunArtifact(bench_exe);
+    run_bench.addPassthruArgs();
+    const bench_step = b.step("bench", "Run benchmarks against ClickHouse on 127.0.0.1:9000 (use -Doptimize=ReleaseFast)");
+    bench_step.dependOn(&run_bench.step);
+
     // --- Examples ---
     // Each example is its own runnable: `zig build run-01-connect`,
     // `zig build run-02-diagnostics`, etc. `zig build examples` builds

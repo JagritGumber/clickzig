@@ -1,0 +1,103 @@
+{
+  "environment": "Zig 0.17.1 \u00b7 ClickHouse 26.3 \u00b7 AMD Ryzen 7 7840HS (16 threads) \u00b7 Linux \u00b7 Io.Threaded",
+  "clickzig": {
+    "read_uint64": {
+      "rows": 20000000,
+      "ns": 42748041,
+      "rows_per_s": 467857696.6836913
+    },
+    "read_uint64_lz4": {
+      "rows": 20000000,
+      "ns": 154036358,
+      "rows_per_s": 129839475.95021689
+    },
+    "read_string": {
+      "rows": 5000000,
+      "ns": 54835566,
+      "rows_per_s": 91181697.65950806
+    },
+    "read_string_lz4": {
+      "rows": 5000000,
+      "ns": 87556005,
+      "rows_per_s": 57106305.84389956
+    },
+    "insert_none": {
+      "rows": 1000000,
+      "ns": 604290201,
+      "rows_per_s": 1654834.048847997
+    },
+    "insert_lz4": {
+      "rows": 1000000,
+      "ns": 604244335,
+      "rows_per_s": 1654959.6613098574
+    },
+    "insert_zstd": {
+      "rows": 1000000,
+      "ns": 604125102,
+      "rows_per_s": 1655286.2920104254
+    }
+  },
+  "reference": {
+    "read_uint64": {
+      "rows": 20000000,
+      "s": 0.044,
+      "rows_per_s": 454545454.54545456
+    },
+    "read_uint64_lz4": {
+      "rows": 20000000,
+      "s": 0.174,
+      "rows_per_s": 114942528.7356322
+    },
+    "read_string": {
+      "rows": 5000000,
+      "s": 0.06,
+      "rows_per_s": 83333333.33333334
+    },
+    "read_string_lz4": {
+      "rows": 5000000,
+      "s": 0.08,
+      "rows_per_s": 62500000.0
+    },
+    "insert_none": {
+      "rows": 100000,
+      "s": 0.061,
+      "rows_per_s": 1639344.262295082
+    }
+  },
+  "concurrency": [
+    {
+      "concurrency": 1,
+      "ns": 473184987,
+      "queries_per_s": 101.44024286214305
+    },
+    {
+      "concurrency": 2,
+      "ns": 315012409,
+      "queries_per_s": 152.37494977539123
+    },
+    {
+      "concurrency": 4,
+      "ns": 222437415,
+      "queries_per_s": 215.7910349749389
+    },
+    {
+      "concurrency": 8,
+      "ns": 181191455,
+      "queries_per_s": 264.9131549829433
+    },
+    {
+      "concurrency": 16,
+      "ns": 180419069,
+      "queries_per_s": 266.04726576878636
+    }
+  ],
+  "ping": {
+    "p50_ns": 18635,
+    "p99_ns": 39524
+  },
+  "notes": [
+    "Loopback TCP, client and server in the same container. Medians of 7 timed passes (3 runs for clickzig), ReleaseFast.",
+    "clickhouse-client is a reference, not a strict head-to-head: it also re-encodes Native output (to /dev/null); time via --time.",
+    "INSERT goes to an ENGINE = Null table; both clients spend ~60ms/batch waiting on the server, so compression does not change it."
+  ]
+}
